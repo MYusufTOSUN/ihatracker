@@ -1,0 +1,81 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEKNOFEST SAVAŞAN İHA - TAKİP VE KONTROL SİSTEMİ BAĞIMLILIKLARI
+# YOLOv11 + TensorRT + SORT + PID | Jetson Nano Optimize
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# TEMEL KÜTÜPHANELER
+# ─────────────────────────────────────────────────────────────────────────────────
+numpy>=1.19.0
+opencv-python>=4.5.0
+scipy>=1.5.0
+pyyaml>=5.4.0
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# PYTORCH & CUDA
+# Jetson Nano için: pip install torch torchvision (önceden kurulu olabilir)
+# PC için: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# ─────────────────────────────────────────────────────────────────────────────────
+torch>=1.8.0
+torchvision>=0.9.0
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# YOLO (Ultralytics YOLOv8/v11)
+# TensorRT entegrasyonu için ultralytics paketi yeterli
+# ─────────────────────────────────────────────────────────────────────────────────
+ultralytics>=8.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# TENSORRT & CUDA (Jetson Nano / NVIDIA GPU)
+# NOT: Bu paketler genellikle sistem seviyesinde kurulur, pip ile kurulmayabilir
+# Jetson: JetPack SDK ile birlikte gelir
+# PC: NVIDIA TensorRT'yi ayrıca indirip kurun
+# ─────────────────────────────────────────────────────────────────────────────────
+# tensorrt>=8.0.0          # Jetson'da JetPack ile gelir
+# pycuda>=2021.1           # CUDA Python bindings
+# cuda-python>=11.0        # NVIDIA CUDA Python
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# SORT TRACKER (Kalman Filter + Hungarian Algorithm)
+# ─────────────────────────────────────────────────────────────────────────────────
+# filterpy>=1.4.5          # Kalman Filter (opsiyonel - kendi implementasyonumuz var)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# SERİ HABERLEŞME (Uçuş Kontrolcüsü ile iletişim)
+# ─────────────────────────────────────────────────────────────────────────────────
+pyserial>=3.5              # UART/Serial iletişim
+# pymavlink>=2.4.0         # MAVLink protokolü (opsiyonel)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# PERFORMANS & LOGGING
+# ─────────────────────────────────────────────────────────────────────────────────
+tqdm>=4.60.0               # İlerleme çubuğu
+loguru>=0.5.0              # Gelişmiş logging (opsiyonel)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# OPSİYONEL - GELİŞTİRME & DEBUG
+# ─────────────────────────────────────────────────────────────────────────────────
+# tensorboard>=2.4.0       # Eğitim/performans görselleştirme
+# matplotlib>=3.3.0        # Grafik çizimi
+# pandas>=1.3.0            # Veri analizi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JETSON NANO KURULUM NOTLARI
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. JetPack SDK'yı kurun (TensorRT, CUDA, cuDNN dahil):
+#    https://developer.nvidia.com/embedded/jetpack
+#
+# 2. PyTorch for Jetson:
+#    https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048
+#    wget https://nvidia.box.com/shared/static/...torch-1.x.whl
+#    pip install torch-1.x.whl
+#
+# 3. TorchVision for Jetson:
+#    git clone https://github.com/pytorch/vision
+#    cd vision && python setup.py install
+#
+# 4. YOLO TensorRT Engine oluşturma:
+#    yolo export model=best.pt format=engine device=0 half=True imgsz=320
+#
+# ═══════════════════════════════════════════════════════════════════════════════

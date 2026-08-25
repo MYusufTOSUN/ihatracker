@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Model agirliklari — depoya ALINMAZ.
+# GitHub tek dosyada 100 MB'i reddediyor; siamrpn_model.pth 411 MB.
+# Ayrica .engine dosyasi GPU mimarisine ve TensorRT surumune bagli, baska
+# makinede acilmiyor — tasinmasinin bir anlami da yok.
+# ---------------------------------------------------------------------------
+yolo/
+*.pt
+*.pth
+*.onnx
+*.onnx.data
+*.engine
+*.trt
+
+# SiamRPN: ByteTrack'e gecildi, artik kullanilmiyor
+siamrpn_config.yaml
+siamrpn_model.pth
+
+# Ic calisma notlari
+BYTETRACK_INFO.md
+KURULUM.md
+OZET_RAPOR.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Sanal ortam
+venv/
+.venv/
+env/
+
+# Kayitlar ve ciktilar
+*.log
+runs/
+output/
+kayit/
+
+# Isletim sistemi / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
