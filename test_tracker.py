@@ -218,3 +218,185 @@ def test_tek_piksel_kutu_cokmez():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# KAMERA HAREKETI TELAFISI (CMC)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _sahne(kaydir_x=0, kaydir_y=0, boyut=(480, 640)):
+    """Dokulu sentetik sahne — optik akis icin kose noktasi gerekiyor."""
+    rng = np.random.default_rng(7)
+    img = rng.integers(0, 255, (boyut[0] + 200, boyut[1] + 200, 3),
+                       dtype=np.uint8)
+    y = 100 + kaydir_y
+    x = 100 + kaydir_x
+    return np.ascontiguousarray(img[y:y + boyut[0], x:x + boyut[1]])
+
+
+def test_cmc_saf_otelemeyi_kestirir():
+    """Kamera saga kayarsa CMC bunu otelemeden okumali."""
+    from iha_tracking_system import CameraMotionCompensator
+    cmc = CameraMotionCompensator(olcek=1.0)
+
+    cmc.hesapla(_sahne(0, 0))
+    M = cmc.hesapla(_sahne(12, 0))       # sahne 12 px kaydi
+
+    tx = M[0, 2]
+    # Isaret, goruntunun kaydigi yonun tersi; buyuklugu tutmali.
+    assert abs(abs(tx) - 12) < 3.0, f"oteleme yanlis kestirildi: {tx}"
+
+
+def test_cmc_hareketsiz_sahnede_birim_dondurur():
+    from iha_tracking_system import CameraMotionCompensator
+    cmc = CameraMotionCompensator(olcek=1.0)
+    kare = _sahne()
+    cmc.hesapla(kare)
+    M = cmc.hesapla(kare.copy())
+    assert abs(M[0, 2]) < 1.0 and abs(M[1, 2]) < 1.0
+
+
+def test_cmc_izin_konumunu_duzeltir():
+    """Kamera hareketi izin Kalman durumundan cikarilmali."""
+    t = KalmanBoxTracker(np.array([100.0, 100.0, 140.0, 200.0]))
+    onceki_x = t.kf.x[0].item()
+
+    M = np.array([[1.0, 0.0, 25.0],
+                  [0.0, 1.0, -10.0]])       # saga 25, yukari 10
+    t.kamera_hareketi_uygula(M)
+
+    assert abs(t.kf.x[0].item() - (onceki_x + 25)) < 1e-6
+    assert abs(t.kf.x[1].item() - (150.0 - 10)) < 1e-6
+
+
+def test_cmc_hizi_otelemeden_etkilenmez():
+    """Oteleme bir KONUM farki; hiza eklenmemeli."""
+    t = KalmanBoxTracker(np.array([100.0, 100.0, 140.0, 200.0]))
+    t.kf.x[4] = 5.0
+    t.kf.x[5] = -3.0
+
+    M = np.array([[1.0, 0.0, 50.0],
+                  [0.0, 1.0, 50.0]])        # saf oteleme
+    t.kamera_hareketi_uygula(M)
+
+    assert abs(t.kf.x[4].item() - 5.0) < 1e-6
+    assert abs(t.kf.x[5].item() - (-3.0)) < 1e-6
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GORUNUM / YENIDEN TANIMA (Re-ID)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _renkli_kare(renk, kutu, boyut=(480, 640)):
+    """Belirli bir kutuda duz renkli bir nesne olan kare."""
+    img = np.full((boyut[0], boyut[1], 3), 30, dtype=np.uint8)
+    x1, y1, x2, y2 = [int(v) for v in kutu[:4]]
+    img[y1:y2, x1:x2] = renk
+    return img
+
+
+def test_gorunum_ayni_nesneyi_yakin_bulur():
+    from iha_tracking_system import AppearanceModel
+    g = AppearanceModel()
+    kutu = [100, 100, 180, 260]
+
+    a = g.cikar(_renkli_kare((30, 200, 40), kutu), np.array(kutu))
+    b = g.cikar(_renkli_kare((32, 198, 44), kutu), np.array(kutu))
+
+    assert AppearanceModel.mesafe(a, b) < 0.2
+
+
+def test_gorunum_farkli_nesneyi_ayirir():
+    from iha_tracking_system import AppearanceModel
+    g = AppearanceModel()
+    kutu = [100, 100, 180, 260]
+
+    yesil = g.cikar(_renkli_kare((30, 200, 40), kutu), np.array(kutu))
+    kirmizi = g.cikar(_renkli_kare((40, 30, 210), kutu), np.array(kutu))
+
+    assert AppearanceModel.mesafe(yesil, kirmizi) > 0.5
+
+
+def test_reid_uzun_kapanmadan_sonra_kimligi_geri_verir():
+    """
+    ASIL TEST: hedef uzun sure kayboluyor, iz siliniyor, sonra BASKA BIR
+    YERDE geri geliyor. Hareket modeli bunu bulamaz — gorunum bulmali.
+    """
+    cfg = SystemConfig(sort_max_age=3, sort_min_hits=1,
+                       reid_enabled=True, cmc_enabled=False,
+                       reid_mesafe_esigi=0.35, reid_hafiza_karesi=90)
+    trk = ByteTrackTracker(cfg)
+
+    renk = (30, 200, 40)
+    kutu = [100, 100, 180, 260]
+
+    # 1) Hedef gorunuyor, iz kuruluyor
+    for _ in range(6):
+        izler = trk.update(dizi(kutu + [0.9]), kare=_renkli_kare(renk, kutu))
+    kimlik = izler[0]["id"]
+
+    # 2) Uzun kapanma — iz max_age'i asip kayip havuzuna dusuyor
+    bos = np.full((480, 640, 3), 30, dtype=np.uint8)
+    for _ in range(10):
+        trk.update(dizi(), kare=bos)
+    assert len(trk.trackers) == 0, "iz aktif listeden dusmeliydi"
+    assert len(trk.kayip_izler) == 1, "iz kayip havuzunda bekliyor olmaliydi"
+
+    # 3) Ayni nesne EKRANIN BASKA YERINDE geri geliyor
+    yeni_kutu = [420, 180, 500, 340]
+    izler = trk.update(dizi(yeni_kutu + [0.9]),
+                       kare=_renkli_kare(renk, yeni_kutu))
+
+    assert izler, "yeniden tanima sonrasi iz bildirilmeliydi"
+    assert izler[0]["id"] == kimlik, (
+        f"kimlik korunmaliydi: {izler[0]['id']} != {kimlik}")
+
+
+def test_reid_farkli_nesneye_ayni_kimligi_vermez():
+    """Yanlis pozitif olmamali: baska renkte bir nesne eski kimligi almamali."""
+    cfg = SystemConfig(sort_max_age=3, sort_min_hits=1,
+                       reid_enabled=True, cmc_enabled=False,
+                       reid_mesafe_esigi=0.35)
+    trk = ByteTrackTracker(cfg)
+
+    kutu = [100, 100, 180, 260]
+    for _ in range(6):
+        izler = trk.update(dizi(kutu + [0.9]),
+                           kare=_renkli_kare((30, 200, 40), kutu))
+    kimlik = izler[0]["id"]
+
+    bos = np.full((480, 640, 3), 30, dtype=np.uint8)
+    for _ in range(10):
+        trk.update(dizi(), kare=bos)
+
+    # Farkli renkte nesne. Yeni iz dogdugu karede bildirilmiyor
+    # (hit_streak >= min_hits kosulu), bu yuzden iki kare besleniyor.
+    yeni_kutu = [420, 180, 500, 340]
+    for _ in range(2):
+        izler = trk.update(dizi(yeni_kutu + [0.9]),
+                           kare=_renkli_kare((40, 30, 210), yeni_kutu))
+
+    assert izler, "yeni iz bildirilmeliydi"
+    assert izler[0]["id"] != kimlik, "farkli nesne eski kimligi aldi"
+    assert len(trk.kayip_izler) == 1, "eski iz havuzda kalmaliydi"
+
+
+def test_reid_kapaliyken_havuz_kullanilmaz():
+    cfg = SystemConfig(sort_max_age=2, sort_min_hits=1, reid_enabled=False,
+                       cmc_enabled=False)
+    trk = ByteTrackTracker(cfg)
+    kutu = [100, 100, 180, 260]
+    for _ in range(4):
+        trk.update(dizi(kutu + [0.9]), kare=_renkli_kare((30, 200, 40), kutu))
+    bos = np.full((480, 640, 3), 30, dtype=np.uint8)
+    for _ in range(6):
+        trk.update(dizi(), kare=bos)
+    assert len(trk.kayip_izler) == 0
+
+
+def test_kare_verilmese_de_calisir():
+    """Geriye donuk uyumluluk: kare gecilmezse CMC/Re-ID sessizce atlanir."""
+    trk = ByteTrackTracker(SystemConfig(sort_min_hits=1))
+    for i in range(10):
+        izler = trk.update(dizi(kutu(100 + i * 5, 100)))
+    assert izler and len(izler) == 1

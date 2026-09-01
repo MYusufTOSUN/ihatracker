@@ -71,6 +71,18 @@ class SystemConfig:
     sort_iou_threshold: float = 0.25
     max_objects: int = 10
 
+    # Kamera hareketi telafisi (CMC)
+    # IHA'da kamera surekli hareket ettigi icin varsayilan ACIK. Sabit
+    # kameradaysan kapatmak birkac FPS kazandirir.
+    cmc_enabled: bool = True
+
+    # Gorunum tabanli yeniden tanima (Re-ID)
+    # Uzun kapanmadan sonra ayni kimligi geri vermek icin. Kapali ise
+    # takipci yalniz harekete bakar.
+    reid_enabled: bool = True
+    reid_mesafe_esigi: float = 0.35   # bu mesafenin altinda "ayni nesne"
+    reid_hafiza_karesi: int = 90      # kayip iz havuzunda bekleme suresi
+
     # ByteTrack iki asamali eslestirme esikleri
     #   >= high            : yeni iz baslatabilir, 1. turda eslestirilir
     #   low <= s < high    : yeni iz BASLATMAZ, yalniz 2. turda mevcut izleri
@@ -251,6 +263,184 @@ class LockState(Enum):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
+# GÖRÜNÜM MODELİ (Re-ID)
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+class AppearanceModel:
+    """
+    Izlerin GORUNUMUNU tanimlayan hafif oznitelik cikarici.
+
+    NEDEN GEREKLI:
+      IoU + Kalman yalniz HAREKETE bakar. Hedef bir engelin arkasina girip
+      birkac saniye sonra BASKA BIR YERDE ciktiginda hareket modeli onu
+      bulamaz: tahmin edilen konum artik gecersizdir, IoU sifirdir, iz silinir
+      ve nesne geri geldiginde YENI KIMLIK alir.
+
+      Gorunum ozniteligi bu bosluga koprudur: "bu, biraz once kaybettigim
+      seyin aynisi mi?" sorusunu konumdan bagimsiz cevaplar.
+
+    NEDEN RENK HISTOGRAMI, DERIN AG DEGIL:
+      OSNet gibi derin Re-ID aglari daha ayirt edici ama her kare, her nesne
+      icin ayri bir ileri gecis demek. Jetson Nano'da bu, tespit modelinin
+      kendisinden pahaliya gelebiliyor ve depoya 10-40 MB'lik ikinci bir
+      model ekliyor.
+
+      HSV renk histogrami neredeyse bedava (kucuk bir kirpim uzerinde birkac
+      yuz mikrosaniye), bagimlilik istemiyor ve gorsel olarak FARKLI hedefleri
+      ayirmakta pratikte yeterli. Ayirt etme gucu derin aglarin altinda —
+      bu bilincli bir takas.
+
+      Daha gucluye ihtiyac olursa: ayni arayuzu (cikar / mesafe) saglayan
+      baska bir sinif yazip degistirmek yeterli, takipci kodu degismez.
+
+    Aydinlatma degisimine karsi: V (parlaklik) kanali kaba kovalara ayrilir,
+    agirlik H ve S kanallarindadir.
+    """
+
+    def __init__(self, h_kova: int = 8, s_kova: int = 8, v_kova: int = 4):
+        self.kovalar = [h_kova, s_kova, v_kova]
+        self.aralik = [0, 180, 0, 256, 0, 256]
+
+    def cikar(self, kare: np.ndarray, kutu: np.ndarray) -> Optional[np.ndarray]:
+        """Kutunun icindeki bolgeden normalize edilmis oznitelik vektoru uret."""
+        h, w = kare.shape[:2]
+        x1 = max(0, int(kutu[0])); y1 = max(0, int(kutu[1]))
+        x2 = min(w, int(kutu[2])); y2 = min(h, int(kutu[3]))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+
+        kirpim = kare[y1:y2, x1:x2]
+
+        # Kenarlar cogu zaman arka plan icerir; merkez bolge daha temiz bir
+        # gorunum verir. Kutunun ortadaki %60'i aliniyor.
+        kh, kw = kirpim.shape[:2]
+        my1 = int(kh * 0.2); my2 = int(kh * 0.8)
+        mx1 = int(kw * 0.2); mx2 = int(kw * 0.8)
+        if my2 - my1 >= 2 and mx2 - mx1 >= 2:
+            kirpim = kirpim[my1:my2, mx1:mx2]
+
+        hsv = cv2.cvtColor(kirpim, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, self.kovalar, self.aralik)
+        hist = hist.flatten().astype(np.float32)
+
+        norm = np.linalg.norm(hist)
+        if norm < 1e-6:
+            return None
+        return hist / norm          # L2 normalize -> kosinus mesafesi icin
+
+    @staticmethod
+    def mesafe(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+        """Kosinus mesafesi [0, 1]. Oznitelik yoksa 1.0 (tamamen farkli)."""
+        if a is None or b is None:
+            return 1.0
+        return float(np.clip(1.0 - float(np.dot(a, b)), 0.0, 1.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# KAMERA HAREKETİ TELAFİSİ (CMC)
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+class CameraMotionCompensator:
+    """
+    Ardisik iki kare arasindaki KAMERA hareketini kestirir.
+
+    NEDEN GEREKLI (IHA icin kritik):
+      Kalman filtresi "sabit hiz" varsayar — nesnenin kendi hareketini
+      ogrenir ve suruklenmesini tahmin eder. Kamera SABITKEN bu dogrudur.
+
+      Ama IHA'da kamera surekli hareket ediyor: donuyor, yalpaliyor, irtifa
+      degistiriyor. Bu durumda sahnedeki HER SEY birlikte kayiyor ve Kalman
+      bunu nesnenin kendi hareketi saniyor. Tahmin gercek konumdan uzaklasiyor,
+      IoU dusuyor, eslestirme kopuyor, kimlik degisiyor.
+
+      Cozum: kareler arasi global hareketi olcup TUM izlerin durumundan
+      cikarmak. Boylece Kalman yalniz nesnenin GERCEK hareketini modelliyor.
+
+    YONTEM (BoT-SORT ile ayni yaklasim):
+      Seyrek optik akis. Onceki karede iyi izlenebilir kose noktalari bulunur,
+      Lucas-Kanade ile yeni karedeki karsiliklari bulunur, aradaki donusum
+      RANSAC ile kestirilir. Yogun akistan cok daha ucuz — Jetson'da gercek
+      zamanli calisabilmesinin sebebi bu.
+
+      Hareketli nesnelerin uzerindeki noktalar aykiri deger olarak RANSAC
+      tarafindan elenir; kestirim sahnenin genelini, yani kamerayi yakalar.
+    """
+
+    def __init__(self, olcek: float = 0.5, en_az_nokta: int = 12):
+        # Kestirim KUCULTULMUS goruntude yapilir. Kamera hareketi dusuk
+        # frekansli bir sinyal oldugu icin tam cozunurluk gereksiz; 0.5 ile
+        # maliyet dortte bire iniyor, dogruluk pratikte ayni kaliyor.
+        self.olcek = olcek
+        self.en_az_nokta = en_az_nokta
+        self.onceki_gri = None
+        self.son_matris = np.eye(2, 3, dtype=np.float64)
+
+    def sifirla(self):
+        self.onceki_gri = None
+
+    def hesapla(self, kare: np.ndarray) -> np.ndarray:
+        """Bu kare ile bir oncekisi arasindaki 2x3 afin donusumu dondur.
+
+        Kestirilemezse BIRIM matris doner — yani "kamera hareket etmedi"
+        varsayilir. Guvenli taraf bu: yanlis bir donusum uygulamaktansa
+        hic uygulamamak yeglenir.
+        """
+        birim = np.eye(2, 3, dtype=np.float64)
+
+        gri = cv2.cvtColor(kare, cv2.COLOR_BGR2GRAY)
+        if self.olcek != 1.0:
+            gri = cv2.resize(gri, None, fx=self.olcek, fy=self.olcek,
+                             interpolation=cv2.INTER_LINEAR)
+
+        if self.onceki_gri is None:
+            self.onceki_gri = gri
+            return birim
+
+        onceki_noktalar = cv2.goodFeaturesToTrack(
+            self.onceki_gri, maxCorners=200, qualityLevel=0.01,
+            minDistance=10, blockSize=3,
+        )
+        if onceki_noktalar is None or len(onceki_noktalar) < self.en_az_nokta:
+            self.onceki_gri = gri
+            return birim
+
+        yeni_noktalar, durum, _ = cv2.calcOpticalFlowPyrLK(
+            self.onceki_gri, gri, onceki_noktalar, None,
+            winSize=(21, 21), maxLevel=3,
+        )
+        if yeni_noktalar is None:
+            self.onceki_gri = gri
+            return birim
+
+        gecerli = durum.ravel() == 1
+        a = onceki_noktalar[gecerli].reshape(-1, 2)
+        b = yeni_noktalar[gecerli].reshape(-1, 2)
+        if len(a) < self.en_az_nokta:
+            self.onceki_gri = gri
+            return birim
+
+        # Kismi afin: oteleme + donme + tek olcek. Tam afin (kesme dahil)
+        # gurultuye daha duyarli ve kamera hareketi icin gereksiz.
+        M, _ = cv2.estimateAffinePartial2D(
+            a, b, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+            maxIters=2000, confidence=0.99,
+        )
+
+        self.onceki_gri = gri
+        if M is None:
+            return birim
+
+        M = M.astype(np.float64)
+        if self.olcek != 1.0:
+            # Kucultulmus goruntude bulundu; OTELEMEYI tam cozunurluge tasi.
+            # Donme ve olcek bilesenleri olcekten bagimsizdir.
+            M[:, 2] /= self.olcek
+
+        self.son_matris = M
+        return M
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
 # KALMAN FİLTRESİ (SORT için - filterpy bağımlılığı olmadan)
 # ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -367,6 +557,25 @@ class KalmanBoxTracker:
         self.hits = 0
         self.hit_streak = 0
         self.age = 0
+
+        # Gorunum hafizasi (Re-ID). Tek bir karenin ozniteligi gurultulu
+        # oldugu icin ustel hareketli ortalama ile yumusatiliyor: iz zamanla
+        # KARARLI bir gorunum profili biriktiriyor, anlik bozulmalar
+        # (bulaniklik, kismi kapanma) profili silip supurmuyor.
+        self.ozellik: Optional[np.ndarray] = None
+        self.kayip_suresi = 0        # kac karedir kayip havuzunda
+
+    def ozellik_guncelle(self, yeni: Optional[np.ndarray], alpha: float = 0.9):
+        """Gorunum profilini ustel hareketli ortalama ile guncelle."""
+        if yeni is None:
+            return
+        if self.ozellik is None:
+            self.ozellik = yeni.copy()
+            return
+        karisim = alpha * self.ozellik + (1.0 - alpha) * yeni
+        norm = np.linalg.norm(karisim)
+        if norm > 1e-6:
+            self.ozellik = karisim / norm
     
     def _bbox_to_z(self, bbox: np.ndarray) -> np.ndarray:
         """[x1, y1, x2, y2] -> [cx, cy, s, r]"""
@@ -402,6 +611,39 @@ class KalmanBoxTracker:
         self.hit_streak += 1
         self.kf.update(self._bbox_to_z(bbox))
     
+    def kamera_hareketi_uygula(self, M: np.ndarray):
+        """Kamera hareketini bu izin Kalman durumuna uygula.
+
+        M, kareler arasi 2x3 afin donusum. Uygulanmazsa Kalman kameranin
+        hareketini nesnenin hareketi sanir ve tahmin surekli kayar.
+
+        Uc bileseni ayri ayri donusturmek gerekiyor:
+          merkez (x, y) : tam afin — donme + olcek + OTELEME
+          alan   (s)    : determinant kadar olceklenir (alan olcegi)
+          hiz  (vx, vy) : yalniz donme + olcek, OTELEME YOK
+                          (oteleme bir konum farki, hiz farki degil)
+        """
+        R = M[:2, :2]
+        t = M[:2, 2]
+
+        R = np.asarray(R, dtype=np.float64)
+        t = np.asarray(t, dtype=np.float64)
+
+        # kf.x sutun vektoru (7,1); .item() hem (1,) hem skaler icin dogru.
+        merkez = np.array([self.kf.x[0].item(), self.kf.x[1].item()])
+        yeni_merkez = R @ merkez + t
+        self.kf.x[0] = yeni_merkez[0]
+        self.kf.x[1] = yeni_merkez[1]
+
+        det = float(np.linalg.det(R))
+        if det > 1e-6:
+            self.kf.x[2] = self.kf.x[2] * det      # s = alan
+
+        hiz = np.array([self.kf.x[4].item(), self.kf.x[5].item()])
+        yeni_hiz = R @ hiz                          # OTELEME YOK
+        self.kf.x[4] = yeni_hiz[0]
+        self.kf.x[5] = yeni_hiz[1]
+
     def predict(self, yaslandir: bool = True) -> np.ndarray:
         """Sonraki pozisyonu tahmin et.
 
@@ -468,6 +710,17 @@ class ByteTrackTracker:
         self.config = config
         self.trackers: List[KalmanBoxTracker] = []
         self.frame_count = 0
+
+        # Kamera hareketi telafisi
+        self.cmc = CameraMotionCompensator() if config.cmc_enabled else None
+
+        # Gorunum modeli ve KAYIP IZ HAVUZU.
+        # Silinmek uzere olan izler dogrudan atilmiyor; bir sure bu havuzda
+        # bekletiliyor. Hedef geri gorundugunde once buraya bakiliyor ve
+        # gorunum eslesirse ESKI KIMLIK geri veriliyor. Bu olmadan uzun
+        # kapanmadan sonra nesne her seferinde yeni kimlik aliyordu.
+        self.gorunum = AppearanceModel() if config.reid_enabled else None
+        self.kayip_izler: List[KalmanBoxTracker] = []
     
     def _iou_batch(self, bb_test: np.ndarray, bb_gt: np.ndarray) -> np.ndarray:
         """
@@ -545,8 +798,61 @@ class ByteTrackTracker:
             np.array(unmatched_trackers)
         )
     
+    def _yeniden_tani(self, kare, detections, eslesmeyen_idx, det_kutular):
+        """Eslesmeyen tespitleri KAYIP IZ HAVUZU ile gorunumden eslestir.
+
+        Donen: hala eslesmeyen tespit indeksleri.
+
+        Buradaki eslestirme KONUMA BAKMAZ — amaci tam olarak konumun
+        gecersiz oldugu durumu kurtarmak: hedef kaybolup baska bir yerde
+        yeniden gorundugunde.
+        """
+        if (self.gorunum is None or kare is None
+                or not len(eslesmeyen_idx) or not self.kayip_izler):
+            return eslesmeyen_idx
+
+        kalan = []
+        for i in eslesmeyen_idx:
+            ozellik = self.gorunum.cikar(kare, det_kutular[i])
+            if ozellik is None:
+                kalan.append(i)
+                continue
+
+            en_iyi, en_iyi_mesafe = None, self.config.reid_mesafe_esigi
+            for iz in self.kayip_izler:
+                d = AppearanceModel.mesafe(ozellik, iz.ozellik)
+                if d < en_iyi_mesafe:
+                    en_iyi, en_iyi_mesafe = iz, d
+
+            if en_iyi is not None and len(self.trackers) < self.config.max_objects:
+                # ESKI KIMLIK geri geliyor. Konum yeni tespitten aliniyor,
+                # hiz sifirlaniyor: nerede oldugunu bilmiyorduk, eski hiz
+                # artik gecerli degil.
+                en_iyi.kf.x[:4] = en_iyi._bbox_to_z(det_kutular[i])
+                en_iyi.kf.x[4:] = 0.0
+                en_iyi.time_since_update = 0
+                en_iyi.hit_streak = self.config.sort_min_hits
+                en_iyi.kayip_suresi = 0
+                en_iyi.ozellik_guncelle(ozellik)
+                self.kayip_izler.remove(en_iyi)
+                self.trackers.append(en_iyi)
+            else:
+                kalan.append(i)
+
+        return np.array(kalan, dtype=int) if kalan else np.empty(0, dtype=int)
+
+    def _kayip_havuzunu_yasat(self):
+        """Havuzdaki izleri yaslandir, suresi dolani at."""
+        for iz in self.kayip_izler:
+            iz.kayip_suresi += 1
+        self.kayip_izler = [
+            iz for iz in self.kayip_izler
+            if iz.kayip_suresi <= self.config.reid_hafiza_karesi
+        ]
+
     def update(self, detections: np.ndarray,
-               tespit_karesi: bool = True) -> List[Dict]:
+               tespit_karesi: bool = True,
+               kare: Optional[np.ndarray] = None) -> List[Dict]:
         """
         SORT güncelleme.
 
@@ -560,6 +866,19 @@ class ByteTrackTracker:
             Aktif track'lerin listesi: [{'id': int, 'bbox': [x1,y1,x2,y2], 'score': float}, ...]
         """
         self.frame_count += 1
+
+        # 0. KAMERA HAREKETI TELAFISI — tahminden ONCE.
+        # Kareler arasi global hareket olculup her izin durumundan
+        # cikariliyor, boylece Kalman yalniz nesnenin kendi hareketini
+        # modelliyor. Bu adim atlanirsa IHA'da kamera her donusunde
+        # tahminler kayiyor ve eslestirme kopuyor.
+        if self.cmc is not None and kare is not None:
+            M = self.cmc.hesapla(kare)
+            if not np.allclose(M, np.eye(2, 3)):
+                for trk in self.trackers:
+                    trk.kamera_hareketi_uygula(M)
+                for trk in self.kayip_izler:
+                    trk.kamera_hareketi_uygula(M)
 
         # 1. Mevcut tracker'ların tahminini al
         predicted_boxes = np.zeros((len(self.trackers), 4))
@@ -632,17 +951,41 @@ class ByteTrackTracker:
             eslesmeyen_izler = eslesmeyen_izler[hala_eslesmeyen] \
                 if len(hala_eslesmeyen) else np.empty(0, dtype=int)
 
-        # ── 3. Yeni iz: YALNIZ yuksek guvenli, eslesmemis tespitlerden
+        # ── 3. Gorunum profillerini guncelle (eslesen izler)
+        if self.gorunum is not None and kare is not None:
+            for trk in self.trackers:
+                if trk.time_since_update == 0:
+                    trk.ozellik_guncelle(
+                        self.gorunum.cikar(kare, trk.get_state()))
+
+        # ── 4. YENIDEN TANIMA: eslesmeyen yuksek guvenli tespitleri once
+        # kayip iz havuzuyla dene. Eslesirse eski kimlik geri gelir.
+        eslesmeyen_yuksek = self._yeniden_tani(
+            kare, detections, eslesmeyen_yuksek, det_yuksek)
+
+        # ── 5. Yeni iz: geriye kalan yuksek guvenli tespitlerden
         for i in eslesmeyen_yuksek:
             if len(self.trackers) < self.config.max_objects:
-                self.trackers.append(KalmanBoxTracker(det_yuksek[i]))
+                yeni = KalmanBoxTracker(det_yuksek[i])
+                if self.gorunum is not None and kare is not None:
+                    yeni.ozellik_guncelle(
+                        self.gorunum.cikar(kare, det_yuksek[i]))
+                self.trackers.append(yeni)
         
-        # 5. Kayıp tracker'ları temizle
+        # 6. Suresi dolan izler: SILINMIYOR, kayip havuzuna tasiniyor.
+        # Gorunum profili olan bir iz, hedef geri gorundugunde kimligini
+        # geri kazanabilsin diye bir sure saklaniyor.
         i = len(self.trackers)
         for trk in reversed(self.trackers):
             i -= 1
             if trk.time_since_update > self.config.sort_max_age:
                 self.trackers.pop(i)
+                if (self.gorunum is not None and trk.ozellik is not None
+                        and trk.hits >= self.config.sort_min_hits):
+                    trk.kayip_suresi = 0
+                    self.kayip_izler.append(trk)
+
+        self._kayip_havuzunu_yasat()
         
         # 6. Aktif track'leri döndür
         results = []
@@ -1364,7 +1707,8 @@ class IHATrackingSystem:
                 # 2. SORT Takip (her frame'de çalışır - Kalman tahmin yapar).
                 # run_yolo bilgisi tracker'a GECILIYOR: atlanan karelerde izler
                 # hareket tahmini alir ama kayip sayilmaz.
-                tracked_objects = self.tracker.update(detections, tespit_karesi=run_yolo)
+                tracked_objects = self.tracker.update(
+                    detections, tespit_karesi=run_yolo, kare=frame)
                 
                 # 3. Kilitlenme Takibi
                 lock_state, primary_target, lock_progress = self.lock_tracker.update(tracked_objects)
@@ -1524,6 +1868,15 @@ ornekler:
 
     g = p.add_argument_group("takip ve kilit")
     g.add_argument("--max-objects", type=int, default=10)
+    g.add_argument("--no-cmc", action="store_true",
+                   help="kamera hareketi telafisini kapat — kamera SABITSE "
+                        "kare basina ~3 ms kazandirir")
+    g.add_argument("--no-reid", action="store_true",
+                   help="gorunum tabanli yeniden tanimayi kapat — takipci "
+                        "yalniz harekete bakar")
+    g.add_argument("--reid-thresh", type=float, default=0.35,
+                   help="yeniden tanima gorunum mesafesi esigi; dusurmek "
+                        "yanlis eslesmeyi azaltir, kurtarmayi zorlastirir")
     g.add_argument("--lock-seconds", type=float, default=4.0,
                    help="kesintisiz kilit suresi (yarisma kurali)")
 
@@ -1554,6 +1907,9 @@ def main():
         yolo_classes=tuple(a.classes),
 
         # Takip
+        cmc_enabled=not a.no_cmc,
+        reid_enabled=not a.no_reid,
+        reid_mesafe_esigi=a.reid_thresh,
         max_objects=a.max_objects,
         lock_duration_required=a.lock_seconds,
 

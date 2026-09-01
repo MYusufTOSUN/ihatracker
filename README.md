@@ -20,7 +20,8 @@ TESPİT        YOLO  (PyTorch · ONNX · TensorRT)
       │       çıktı: [x1, y1, x2, y2, skor]
       ▼
 TAKİP         ByteTrack + Kalman filtresi
-      │       iki aşamalı eşleştirme, kalıcı kimlik
+      │       iki aşamalı eşleştirme · kamera hareketi telafisi
+      │       görünümle yeniden tanıma · kalıcı kimlik
       ▼
 KİLİT         hedef üzerinde kesintisiz süre sayacı
       │
@@ -129,6 +130,19 @@ Tek eşikli bir sistem o tespiti çöpe atar ve iz kopar. İkinci eşik onu yaka
 - Kimlik sık değişiyorsa → `--conf-low` düşür (0.05'e kadar)
 - Hayalet izler oluşuyorsa → `--conf` yükselt
 
+### Kamera hareketi ve yeniden tanıma
+
+İkisi de **varsayılan açık.** Kapatmak için:
+
+| seçenek | ne yapar | ne zaman kapatılır |
+|---|---|---|
+| `--no-cmc` | kamera hareketi telafisini kapatır | kamera sabitse (~3 ms/kare kazanç) |
+| `--no-reid` | görünümle yeniden tanımayı kapatır | tek hedef varsa, ya da hedefler birbirine çok benziyorsa |
+| `--reid-thresh` | görünüm eşleşme sıkılığı (varsayılan 0.35) | yanlış eşleşme varsa düşür |
+
+`--reid-thresh` iki yönlü bir takas: **düşürmek** yanlış eşleşmeyi azaltır ama
+kaybolan hedefi geri kazanmayı zorlaştırır; **yükseltmek** tersini yapar.
+
 ### Takip davranışı
 
 `SystemConfig` içinden ayarlanır (`iha_tracking_system.py` başında):
@@ -141,6 +155,7 @@ Tek eşikli bir sistem o tespiti çöpe atar ve iz kopar. İkinci eşik onu yaka
 | `max_objects` | aynı anda kaç iz | sahnede çok nesne varsa yükselt |
 | `lock_duration_required` | kesintisiz kilit süresi | yarışma kuralı — 4 sn |
 | `lock_lost_timeout` | kilit kaç sn kayıpta bozulur | kare atlama fazlaysa yükselt |
+| `reid_hafiza_karesi` | kayıp iz kaç kare hatırlanır | kapanmalar uzunsa yükselt |
 
 ### Tespit filtreleri
 
@@ -217,6 +232,61 @@ Bu yüzden takipçi o karede tespit çalışıp çalışmadığını bilir ve iz
 
 ---
 
+## Kamera hareketi telafisi
+
+Kalman filtresi **sabit hız** varsayar: nesnenin kendi hareketini öğrenir ve
+sürüklenmesini tahmin eder. Kamera sabitken bu doğrudur.
+
+İHA'da değil. Kamera dönüyor, yalpalıyor, irtifa değiştiriyor — o anda
+görüntüdeki **her şey** birlikte kayıyor. Kalman bunu nesnenin kendi hareketi
+sanıyor, tahmin gerçek konumdan uzaklaşıyor, IoU düşüyor, kimlik kopuyor.
+
+Çözüm, [BoT-SORT](https://arxiv.org/abs/2206.14651)'un yaklaşımı: kareler arası
+global hareketi ölç, **tüm izlerin durumundan çıkar.** Seyrek optik akış
+(`goodFeaturesToTrack` + Lucas-Kanade) ile nokta eşleşmeleri bulunur, aradaki
+afin dönüşüm RANSAC ile kestirilir. Hareketli nesnelerin üzerindeki noktalar
+aykırı değer olarak elenir, geriye sahnenin geneli — yani kamera — kalır.
+
+Ölçüm — kameranın sert yalpaladığı 120 karelik sentetik senaryo, tek hedef.
+**Doğru sonuç 1 kimliktir**; fazlası kopmuş takip demek:
+
+| | CMC kapalı | CMC açık |
+|---|---|---|
+| `--skip 1` | 67/120 kare, **23 kimlik** | 120/120 kare, **1 kimlik** |
+| `--skip 2` | 44/120 kare, **11 kimlik** | 118/120 kare, **1 kimlik** |
+| `--skip 3` | 29/120 kare, **9 kimlik** | 116/120 kare, **1 kimlik** |
+
+Kare atlama arttıkça fark büyüyor: ara karelerde konum tamamen Kalman
+tahminine kaldığı için, telafi edilmemiş kamera hareketi orada birikiyor.
+
+Maliyet CPU'da kare başına ~3 ms (640×480). Uçtan uca aynı videoda 22,5 → 20,6
+FPS. Kamera sabitse `--no-cmc` ile kapat.
+
+---
+
+## Görünümle yeniden tanıma (Re-ID)
+
+IoU ve Kalman yalnız **harekete** bakar. Hedef bir engelin arkasına girip
+birkaç saniye sonra **başka bir yerde** çıktığında hareket modeli çaresizdir:
+tahmin edilen konum artık geçersiz, IoU sıfır. İz silinir, nesne geri
+geldiğinde **yeni kimlik** alır.
+
+Bu yüzden süresi dolan izler doğrudan atılmıyor; bir **kayıp iz havuzunda**
+`reid_hafiza_karesi` kadar bekletiliyor. Eşleşmeyen yeni bir tespit geldiğinde
+önce bu havuza bakılıyor ve görünüm tutarsa **eski kimlik geri veriliyor.**
+
+Görünüm tanımı HSV renk histogramı; izin profili üstel hareketli ortalamayla
+güncelleniyor, böylece anlık bulanıklık veya kısmi kapanma profili bozmuyor.
+
+**Neden derin ağ değil:** OSNet gibi Re-ID ağları daha ayırt edicidir ama her
+kare, her nesne için ayrı bir ileri geçiş demek — Jetson Nano'da bu, tespit
+modelinin kendisinden pahalıya gelebiliyor ve depoya ikinci bir model ekliyor.
+Renk histogramı kare başına ~0,1 ms, sıfır bağımlılık. **Ayırt etme gücü derin
+ağların altında — bu bilinçli bir takas.** Daha güçlüsü gerekirse aynı arayüzü
+(`cikar` / `mesafe`) veren bir sınıf yazmak yeterli, takipçi kodu değişmez.
+
+---
+
 ## Dosyalar
 
 | dosya | ne yapar |
@@ -237,10 +307,12 @@ pip install pytest
 pytest test_tracker.py -v
 ```
 
-15 test; kamera, model veya GPU gerektirmez, saniyeler içinde biter. Çoğu
+25 test; kamera, model veya GPU gerektirmez, saniyeler içinde biter. Çoğu
 düzeltilmiş bir hatayı kilitleyen regresyon testidir — kare atlamada iz
-sürekliliği, kapanmada kimlik korunması, PID çıkış sınırları, dejenere kutuda
-NaN oluşmaması.
+sürekliliği, kapanmada kimlik korunması, kamera hareketinin doğru kestirilmesi
+ve ötelemenin hıza eklenmemesi, uzun kapanmadan sonra kimliğin geri gelmesi ve
+farklı bir nesneye **yanlışlıkla** verilmemesi, PID çıkış sınırları, dejenere
+kutuda NaN oluşmaması.
 
 Kurulumu doğrulamak için:
 
