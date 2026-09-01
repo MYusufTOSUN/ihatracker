@@ -36,7 +36,7 @@ import queue
 from collections import deque
 from scipy.optimize import linear_sum_assignment
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Union
 from enum import Enum
 
 # Opsiyonel: Seri haberleşme
@@ -65,11 +65,21 @@ class SystemConfig:
     yolo_skip_frames: int = 2  # Her N frame'de bir YOLO çalıştır (2-3 önerilir)
     yolo_half: bool = True     # FP16 kullan (hız artışı)
     
-    # SORT Tracker Ayarları
+    # Takip Ayarları (ByteTrack + Kalman)
     sort_max_age: int = 45        # Frame skip için artırıldı
     sort_min_hits: int = 2        # Daha hızlı onay
     sort_iou_threshold: float = 0.25
     max_objects: int = 10
+
+    # ByteTrack iki asamali eslestirme esikleri
+    #   >= high            : yeni iz baslatabilir, 1. turda eslestirilir
+    #   low <= s < high    : yeni iz BASLATMAZ, yalniz 2. turda mevcut izleri
+    #                        ayakta tutar (kapanma anini kurtaran adim)
+    #   < low              : tamamen yoksayilir
+    # yolo_conf_threshold bu yuzden DUSUK tutulur; asil eleme burada yapilir.
+    track_high_thresh: float = 0.5
+    track_low_thresh: float = 0.1
+    track_low_iou_thresh: float = 0.15   # 2. turda esik gevsetilir
     
     # Kilitlenme Ayarları
     lock_duration_required: float = 4.0  # Saniye cinsinden (yarışma kuralı)
@@ -108,13 +118,20 @@ class SystemConfig:
     show_trails: bool = True
     trail_length: int = 20     # Azaltıldı (hız için)
     
-    # Kamera
-    camera_id: int = 0
+    # Kamera / görüntü kaynağı
+    # camera_id: kamera indeksi (0, 1, ...) VEYA bir video dosyası yolu.
+    # Dosya verildiginde kare atlanmaz ve akis sonunda program temiz kapanir.
+    camera_id: Union[int, str] = 0
     camera_width: int = 640
     camera_height: int = 480
-    
+
     # Threading
-    use_threading: bool = True  # Kamera okumayı ayrı thread'de yap
+    # Yalniz CANLI kamerada anlamli. Dosya kaynaginda VideoSource bunu zaten
+    # yok sayar; dosyada threadli okuma kare atlatir ve CPU'yu bosuna doldurur.
+    use_threading: bool = True
+
+    # Kayit
+    record_path: str = ""   # bos degilse islenmis goruntu buraya yazilir
 
     # Tespit Filtreleri
     yolo_classes: tuple = (0,)    # Sadece bu class ID'leri takip et
@@ -128,47 +145,101 @@ class SystemConfig:
 # THREADED KAMERA OKUYUCU (FPS Artışı)
 # ═══════════════════════════════════════════════════════════════════════════════════
 
-class ThreadedCamera:
+class VideoSource:
     """
-    Kamera okumayı ayrı bir thread'de yaparak FPS artışı sağlar.
-    Ana thread YOLO işlerken, bu thread sürekli yeni frame alır.
+    Görüntü kaynağı. Canlı kamera ile video dosyasını AYRI ele alır.
+
+    NEDEN AYRI:
+      Canlı kamerada amaç HER ZAMAN EN GÜNCEL kareyi almaktır — YOLO bir kareyi
+      işlerken gelen ara kareler atılmalı, yoksa görüntü gerçeğin gerisine düşer.
+      Bunun için ayrı bir thread sürekli okuyup en sonuncuyu tutar.
+
+      Video dosyasında ise tam tersi: hiçbir kare atlanmamalı ve oynatma kendi
+      hızında ilerlemeli. Dosyada cv2.read() anında döndüğü için threadli okuma
+      bir çekirdeği tam doldurup videoyu sonuna kadar koştururdu.
+
+    Dosya kaynağında bu yüzden thread kullanılmaz; okuma doğrudan yapılır.
+    Akış bittiğinde eof işaretlenir — çağıran taraf döngüden çıkabilsin diye.
     """
-    
-    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480):
-        self.cap = cv2.VideoCapture(camera_id)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Buffer küçült
-        
+
+    def __init__(self, source, width: int = 640, height: int = 480):
+        # "0" gibi bir dizge geldiyse kamera indeksine çevir
+        if isinstance(source, str) and source.isdigit():
+            source = int(source)
+
+        self.is_file = isinstance(source, str)
+        self.cap = cv2.VideoCapture(source)
+
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Görüntü kaynağı açılamadı: {source}")
+
+        if not self.is_file:
+            # Yalnız canlı kamerada anlamlı: küçük tampon = düşük gecikme
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.eof = False
         self.frame = None
         self.ret = False
         self.stopped = False
         self.lock = threading.Lock()
-        
-        # Thread başlat
-        self.thread = threading.Thread(target=self._update, daemon=True)
-        self.thread.start()
-    
+        self.thread = None
+
+        if not self.is_file:
+            self.thread = threading.Thread(target=self._update, daemon=True)
+            self.thread.start()
+
     def _update(self):
-        """Sürekli frame oku"""
+        """Canlı kamera: sürekli oku, en sonuncuyu tut."""
+        basarisiz = 0
         while not self.stopped:
             ret, frame = self.cap.read()
+            if not ret:
+                # Kamera çekildi ya da sürücü hata verdi. Sonsuz hızda dönmemek
+                # icin nefes al; arka arkaya çok olursa akışı bitmiş say.
+                basarisiz += 1
+                if basarisiz > 100:
+                    with self.lock:
+                        self.eof = True
+                    return
+                time.sleep(0.01)
+                continue
+            basarisiz = 0
             with self.lock:
-                self.ret = ret
+                self.ret = True
                 self.frame = frame
-    
+
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Son frame'i döndür"""
+        if self.is_file:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.eof = True
+                return False, None
+            return True, frame
+
         with self.lock:
-            return self.ret, self.frame.copy() if self.frame is not None else None
-    
+            if self.frame is None:
+                return False, None
+            return self.ret, self.frame.copy()
+
+    def is_finished(self) -> bool:
+        """Akış kalıcı olarak bitti mi (dosya sonu / kamera koptu)."""
+        with self.lock:
+            return self.eof
+
     def isOpened(self) -> bool:
         return self.cap.isOpened()
-    
+
     def release(self):
         self.stopped = True
-        self.thread.join(timeout=1.0)
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
         self.cap.release()
+
+
+# Geriye dönük uyumluluk: eski ad hâlâ çalışsın
+ThreadedCamera = VideoSource
 
 
 class LockState(Enum):
@@ -331,18 +402,34 @@ class KalmanBoxTracker:
         self.hit_streak += 1
         self.kf.update(self._bbox_to_z(bbox))
     
-    def predict(self) -> np.ndarray:
-        """Sonraki pozisyonu tahmin et"""
+    def predict(self, yaslandir: bool = True) -> np.ndarray:
+        """Sonraki pozisyonu tahmin et.
+
+        yaslandir=False: hareket tahmini yapilir ama iz YASLANDIRILMAZ.
+
+        NEDEN: YOLO'yu her karede degil her N karede bir calistiriyoruz
+        (yolo_skip_frames). Ara karelerde tespit YOK ama bu bir KAYIP degil,
+        bilincli bir tasarruf. Bu kareleri de kayip saymak iki seyi bozuyordu:
+
+          1. hit_streak her ara karede sifirlaniyordu, dolayisiyla
+             hit_streak >= sort_min_hits kosulu ASLA saglanmiyordu
+             (varsayilan skip=2, min_hits=2 ile hicbir iz bildirilmiyordu).
+          2. time_since_update artiyor, iz "aktif degil" sayilip
+             takipcinin cikti kapisindan eleniyordu.
+
+        Gercek kayiplar (YOLO calisti ama hedefi bulamadi) yine yaslandirilir.
+        """
         if (self.kf.x[6] + self.kf.x[2]) <= 0:
             self.kf.x[6] *= 0.0
-        
+
         self.kf.predict()
         self.age += 1
-        
-        if self.time_since_update > 0:
-            self.hit_streak = 0
-        self.time_since_update += 1
-        
+
+        if yaslandir:
+            if self.time_since_update > 0:
+                self.hit_streak = 0
+            self.time_since_update += 1
+
         self.history.append(self._z_to_bbox(self.kf.x))
         return self.history[-1]
     
@@ -360,15 +447,21 @@ class KalmanBoxTracker:
 # SORT TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════════
 
-class SortTracker:
+class ByteTrackTracker:
     """
-    SORT: Simple Online and Realtime Tracking
-    
+    ByteTrack + Kalman Filter ile çoklu nesne takibi.
+
     Çalışma Prensibi:
-    1. Kalman Filter ile sonraki pozisyon tahmini
-    2. Hungarian Algorithm ile tespit-tahmin eşleştirmesi
-    3. Eşleşmeyen tespitler → yeni track
-    4. Eşleşmeyen tahminler → kayıp track (max_age sonra silinir)
+      1. Kalman Filter ile her izin sonraki pozisyonu tahmin edilir
+      2. IKI ASAMALI eslestirme (Hungarian, maliyet = 1 - IoU):
+           1. tur — yuksek guvenli tespitler  -> tum izler
+           2. tur — dusuk guvenli tespitler   -> eslesmeden kalan izler
+      3. Eslesmeyen YUKSEK guvenli tespit -> yeni iz
+      4. Eslesmeyen iz -> yaslanir, max_age sonra silinir
+
+    2. turun anlami: hedef kismen kapandiginda tespit guveni duser ama nesne
+    hala oradadir. Tek asamali bir eslestirici o tespiti atar ve kimlik kopar.
+    Ikinci tur onu yakalayip izi ayakta tutar — kilit bu sayede bozulmuyor.
     """
     
     def __init__(self, config: SystemConfig):
@@ -452,24 +545,28 @@ class SortTracker:
             np.array(unmatched_trackers)
         )
     
-    def update(self, detections: np.ndarray) -> List[Dict]:
+    def update(self, detections: np.ndarray,
+               tespit_karesi: bool = True) -> List[Dict]:
         """
         SORT güncelleme.
-        
+
         Args:
             detections: (N, 5) [x1, y1, x2, y2, score] formatında
-        
+            tespit_karesi: Bu karede YOLO calisti mi. False ise izler
+                hareket tahmini alir ama yaslandirilmaz — kare atlama
+                bilincli bir tasarruf, kayip degil.
+
         Returns:
             Aktif track'lerin listesi: [{'id': int, 'bbox': [x1,y1,x2,y2], 'score': float}, ...]
         """
         self.frame_count += 1
-        
+
         # 1. Mevcut tracker'ların tahminini al
         predicted_boxes = np.zeros((len(self.trackers), 4))
         to_delete = []
-        
+
         for i, trk in enumerate(self.trackers):
-            pos = trk.predict()
+            pos = trk.predict(yaslandir=tespit_karesi)
             predicted_boxes[i] = pos
             # Geçersiz tahmin kontrolü
             if np.any(np.isnan(pos)):
@@ -480,22 +577,65 @@ class SortTracker:
             self.trackers.pop(i)
             predicted_boxes = np.delete(predicted_boxes, i, axis=0)
         
-        # 2. Tespit-tahmin eşleştirmesi
-        det_boxes = detections[:, :4] if len(detections) > 0 else np.empty((0, 4))
-        
-        matches, unmatched_dets, unmatched_trks = self._associate_detections_to_trackers(
-            det_boxes, predicted_boxes, self.config.sort_iou_threshold
-        )
-        
-        # 3. Eşleşen tracker'ları güncelle
-        for d, t in matches:
-            self.trackers[t].update(detections[d, :4])
-        
-        # 4. Yeni tracker'lar oluştur
-        for i in unmatched_dets:
+        # ─── 2. IKI ASAMALI ESLESTIRME (ByteTrack) ──────────────────────────
+        #
+        # Tek asamali eslestirici, esigin altinda kalan tespitleri atar.
+        # Sorun su: hedef kismen kapandiginda ya da hizli hareket ettiginde
+        # guven skoru duser — nesne HALA ORADA ama tespit cope gider ve iz
+        # kopar. Kimlik degisir, kilit sifirlanir.
+        #
+        # ByteTrack bunu iki turda cozer:
+        #   1. tur — YUKSEK guvenli tespitler tum izlerle eslestirilir
+        #   2. tur — eslesmeden KALAN izler, DUSUK guvenli tespitlerle
+        #            eslestirilir  (kapanma anini kurtaran adim budur)
+        #
+        # Yeni iz YALNIZ yuksek guvenli tespitten dogar; dusuk guvenliler
+        # sadece mevcut izleri ayakta tutar. Yoksa gurultu iz uretirdi.
+
+        if len(detections) > 0:
+            skorlar = detections[:, 4]
+            yuksek = np.where(skorlar >= self.config.track_high_thresh)[0]
+            dusuk = np.where(
+                (skorlar < self.config.track_high_thresh) &
+                (skorlar >= self.config.track_low_thresh)
+            )[0]
+        else:
+            yuksek = np.empty(0, dtype=int)
+            dusuk = np.empty(0, dtype=int)
+
+        det_yuksek = detections[yuksek, :4] if len(yuksek) else np.empty((0, 4))
+        det_dusuk = detections[dusuk, :4] if len(dusuk) else np.empty((0, 4))
+
+        # ── 1. tur: yuksek guven -> tum izler
+        m1, eslesmeyen_yuksek, eslesmeyen_izler = \
+            self._associate_detections_to_trackers(
+                det_yuksek, predicted_boxes, self.config.sort_iou_threshold
+            )
+
+        for d, t in m1:
+            self.trackers[t].update(det_yuksek[d])
+
+        # ── 2. tur: dusuk guven -> 1. turda eslesmeden kalan izler
+        #
+        # Kapanma sirasinda kutu bozulup IoU dustugu icin bu turda esik
+        # GEVSETILIR. Aday havuzu zaten "kaybedilmek uzere olan izler" ile
+        # sinirli oldugu icin yanlis eslestirme riski dusuk.
+        if len(det_dusuk) > 0 and len(eslesmeyen_izler) > 0:
+            kalan_kutular = predicted_boxes[eslesmeyen_izler]
+            m2, _, hala_eslesmeyen = self._associate_detections_to_trackers(
+                det_dusuk, kalan_kutular, self.config.track_low_iou_thresh
+            )
+            for d, t_yerel in m2:
+                gercek = eslesmeyen_izler[t_yerel]
+                self.trackers[gercek].update(det_dusuk[d])
+
+            eslesmeyen_izler = eslesmeyen_izler[hala_eslesmeyen] \
+                if len(hala_eslesmeyen) else np.empty(0, dtype=int)
+
+        # ── 3. Yeni iz: YALNIZ yuksek guvenli, eslesmemis tespitlerden
+        for i in eslesmeyen_yuksek:
             if len(self.trackers) < self.config.max_objects:
-                trk = KalmanBoxTracker(detections[i, :4])
-                self.trackers.append(trk)
+                self.trackers.append(KalmanBoxTracker(det_yuksek[i]))
         
         # 5. Kayıp tracker'ları temizle
         i = len(self.trackers)
@@ -534,6 +674,10 @@ class SortTracker:
             'age': best_track.age,
             'hits': best_track.hits
         }
+
+
+# Geriye donuk uyumluluk: eski ad hala calissin
+SortTracker = ByteTrackTracker
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -863,11 +1007,16 @@ class IHATrackingSystem:
     5. Görselleştirme
     """
     
+    # Egitilmis agirlik bulunamazsa kullanilacak hazir model.
+    # Ultralytics bunu ilk kullanimda kendisi indirir (~6 MB).
+    FALLBACK_MODEL = "yolo11n.pt"
+
     def __init__(self, config: SystemConfig):
         self.config = config
-        
-        # YOLO model yolu belirle
-        self._setup_yolo_path()
+
+        # Kullanici acikca bir model verdiyse arama yapma
+        if not config.yolo_model_path:
+            self._setup_yolo_path()
         
         # Bileşenleri başlat
         print("\n" + "═" * 70)
@@ -878,8 +1027,8 @@ class IHATrackingSystem:
         self.yolo = YOLO(config.yolo_model_path, task='detect')
         print(f"   ✅ YOLO: {os.path.basename(config.yolo_model_path)}")
         
-        self.tracker = SortTracker(config)
-        print("   ✅ SORT Tracker")
+        self.tracker = ByteTrackTracker(config)
+        print("   ✅ ByteTrack + Kalman")
         
         self.lock_tracker = LockTracker(config)
         print("   ✅ Kilitlenme Takibi")
@@ -895,6 +1044,7 @@ class IHATrackingSystem:
         self.frame_count = 0
         self.fps_counter = 0
         self.fps_start_time = time.time()
+        self.session_start = time.time()
         self.current_fps = 0
         
         print("\n" + "═" * 70)
@@ -943,11 +1093,18 @@ class IHATrackingSystem:
                 print(f"   🔍 {model_type} model bulundu: {os.path.basename(path)}")
                 return
         
-        print("❌ YOLO model dosyası bulunamadı!")
-        print(f"   Aranan konumlar:")
-        for c in candidates:
-            print(f"      - {c}")
-        sys.exit(1)
+        # Egitilmis agirliklar depoda YOK (boyut nedeniyle). Bulunamazsa
+        # ultralytics'in hazir modeline dus: ilk calistirmada kendisi indirir.
+        # Boylece depoyu klonlayan biri hicbir sey indirmeden sistemi
+        # calisir halde gorebiliyor.
+        #
+        # NOT: hazir model COCO ile egitilmistir; sinif 0 = "insan".
+        # Kendi agirliklarinla calistirmak icin yolo/best.pt koymak yeterli.
+        self.config.yolo_model_path = self.FALLBACK_MODEL
+        print("   ⚠ Eğitilmiş ağırlık bulunamadı — hazır modele düşülüyor")
+        print(f"     Aranan: {os.path.join(current_dir, 'yolo')}/")
+        print(f"     Kullanılan: {self.FALLBACK_MODEL} (COCO, sınıf 0 = insan)")
+        print("     Kendi modelin için: yolo/best.pt")
     
     def _generate_colors(self, n: int) -> List[Tuple[int, int, int]]:
         """Renk paleti oluştur"""
@@ -1067,58 +1224,101 @@ class IHATrackingSystem:
     def run(self):
         """Ana döngü - Optimize edilmiş versiyon"""
         
-        # Kamera başlat (threaded veya normal)
-        if self.config.use_threading:
-            cap = ThreadedCamera(
-                self.config.camera_id, 
-                self.config.camera_width, 
-                self.config.camera_height
+        # Görüntü kaynağını aç. VideoSource canli kamera ile dosyayi ayirir:
+        # canlida en guncel kareyi tutar, dosyada hicbir kareyi atlamaz.
+        try:
+            cap = VideoSource(
+                self.config.camera_id,
+                self.config.camera_width,
+                self.config.camera_height,
             )
-            print("📷 Kamera açıldı (Threaded mode - Hızlı)")
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            return
+
+        if cap.is_file:
+            toplam = int(cap.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            print(f"🎬 Video dosyası açıldı: {self.config.camera_id}"
+                  + (f"  ({toplam} kare)" if toplam > 0 else ""))
         else:
-            cap = cv2.VideoCapture(self.config.camera_id)
-            if not cap.isOpened():
-                print("❌ Kamera açılamadı!")
-                return
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            print("📷 Kamera açıldı (Normal mode)")
+            print("📷 Kamera açıldı (canlı, en güncel kare)")
+
+        # İstege bagli kayit
+        writer = None
+        if self.config.record_path:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            fps_out = cap.cap.get(cv2.CAP_PROP_FPS) or 30.0
+            if fps_out <= 1 or fps_out > 240:
+                fps_out = 30.0
+            writer = cv2.VideoWriter(
+                self.config.record_path, fourcc, fps_out,
+                (self.config.camera_width, self.config.camera_height),
+            )
+            print(f"💾 Kayıt: {self.config.record_path}")
         
         print(f"   • YOLO imgsz: {self.config.yolo_img_size}")
         print(f"   • Frame skip: {self.config.yolo_skip_frames}")
         print(f"   • Half precision: {self.config.yolo_half}")
         print("   • 'q' ile çıkış\n")
         
-        # YOLO cihaz ve ayarlar
+        # YOLO cihaz ve ayarlar.
+        # predict() argumanlari SABIT bir sozlukte tutuluyor: her karede yeniden
+        # kurulmuyor, ve 'half' YALNIZ gercekten kullanilacaksa ekleniyor.
+        # Yeni ultralytics surumlerinde 'half' kullanimdan kalkti; False olsa
+        # bile gecildiginde her karede uyari basiyordu.
         device = 0 if torch.cuda.is_available() else 'cpu'
         half = self.config.yolo_half and torch.cuda.is_available()
+
+        # ByteTrack'in 2. turu DUSUK guvenli tespitlere ihtiyac duyar; o yuzden
+        # YOLO'yu dusuk esikle calistiriyoruz. Asil eleme takipcide yapiliyor:
+        #   >= track_high_thresh -> yeni iz baslatabilir
+        #   >= track_low_thresh  -> yalniz mevcut izi ayakta tutar
+        # Bu esik YOLO'ya verilseydi kapanma anindaki tespit hic gelmezdi.
+        yolo_conf = min(self.config.yolo_conf_threshold,
+                        self.config.track_low_thresh)
+
+        predict_kwargs = dict(
+            imgsz=self.config.yolo_img_size,
+            conf=yolo_conf,
+            device=device,
+            verbose=False,
+            classes=list(self.config.yolo_classes),
+        )
+        if half:
+            predict_kwargs["half"] = True
         
         # Son tespitleri sakla
         last_detections = np.empty((0, 5))
         detection_count = 0  # Debug için
         
         try:
+            bos_okuma = 0
             while True:
                 ret, frame = cap.read()
+
                 if not ret or frame is None:
+                    # Akis kalici olarak bittiyse cik. Eski surumde burada
+                    # 'continue' vardi: video bitince ya da kamera cekilince
+                    # program %100 CPU'da sonsuza kadar donuyordu.
+                    if cap.is_finished():
+                        print("\n🏁 Görüntü akışı bitti.")
+                        break
+                    # Canli kamerada ilk kareler gelene kadar kisa bekleme
+                    bos_okuma += 1
+                    if bos_okuma > 300:
+                        print("\n⚠ Görüntü alınamıyor, çıkılıyor.")
+                        break
+                    time.sleep(0.005)
                     continue
-                
+
+                bos_okuma = 0
                 self.frame_count += 1
                 
                 # 1. YOLO Tespit (sadece belirli frame'lerde)
                 run_yolo = (self.frame_count % self.config.yolo_skip_frames == 0)
                 
                 if run_yolo:
-                    results = self.yolo.predict(
-                        frame,
-                        imgsz=self.config.yolo_img_size,
-                        conf=self.config.yolo_conf_threshold,
-                        device=device,
-                        half=half,
-                        verbose=False,
-                        classes=self.config.yolo_classes  # Sadece istenen sınıfları tara
-                    )
+                    results = self.yolo.predict(frame, **predict_kwargs)
                     
                     # Tespitleri hazırla [x1, y1, x2, y2, score]
                     detections = []
@@ -1161,8 +1361,10 @@ class IHATrackingSystem:
                     # YOLO çalışmadığında boş gönder - Kalman tahmin devam eder
                     detections = np.empty((0, 5))
                 
-                # 2. SORT Takip (her frame'de çalışır - Kalman tahmin yapar)
-                tracked_objects = self.tracker.update(detections)
+                # 2. SORT Takip (her frame'de çalışır - Kalman tahmin yapar).
+                # run_yolo bilgisi tracker'a GECILIYOR: atlanan karelerde izler
+                # hareket tahmini alir ama kayip sayilmaz.
+                tracked_objects = self.tracker.update(detections, tespit_karesi=run_yolo)
                 
                 # 3. Kilitlenme Takibi
                 lock_state, primary_target, lock_progress = self.lock_tracker.update(tracked_objects)
@@ -1181,24 +1383,29 @@ class IHATrackingSystem:
                     self.flight_controller.send_command(flight_cmd)
                 
                 # 5. Görselleştirme
-                if self.config.show_display:
+                # Cizim, PENCERE ACIK OLMASA DA gerekebilir: --no-display ile
+                # --record birlikte kullanildiginda kayda islenmis goruntu
+                # yazilmali. Bu yuzden kosul "ikisinden biri".
+                ciz = self.config.show_display or writer is not None
+
+                if ciz:
                     # Ham tespitleri çiz (yeşil - debug için)
                     if len(last_detections) > 0:
                         for det in last_detections:
                             x1, y1, x2, y2 = [int(v) for v in det[:4]]
                             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-                            cv2.putText(frame, f"{det[4]:.2f}", (x1, y1-5), 
+                            cv2.putText(frame, f"{det[4]:.2f}", (x1, y1-5),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                    
+
                     display = self._draw_frame(
-                        frame, tracked_objects, lock_state, 
+                        frame, tracked_objects, lock_state,
                         primary_target, lock_progress, flight_cmd
                     )
-                    
+
                     # Debug info
                     cv2.putText(display, f"Det: {detection_count}", (220, 25),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
+
                     # Kilit debug - süre göster
                     if self.lock_tracker.lock_start_time:
                         elapsed = time.time() - self.lock_tracker.lock_start_time
@@ -1206,19 +1413,31 @@ class IHATrackingSystem:
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                         cv2.putText(display, f"ID: {self.lock_tracker.locked_target_id}", (120, 160),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                    
-                    # FPS
-                    self.fps_counter += 1
-                    if time.time() - self.fps_start_time > 1.0:
-                        self.current_fps = self.fps_counter
-                        self.fps_counter = 0
-                        self.fps_start_time = time.time()
-                    
+
+                    if writer is not None:
+                        h, w = display.shape[:2]
+                        if (w, h) != (self.config.camera_width, self.config.camera_height):
+                            display_kayit = cv2.resize(
+                                display,
+                                (self.config.camera_width, self.config.camera_height))
+                        else:
+                            display_kayit = display
+                        writer.write(display_kayit)
+
+                if self.config.show_display:
                     cv2.imshow("IHA Tracking System", display)
-                    
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
-        
+
+                # FPS sayaci GORSELLESTIRMEDEN BAGIMSIZ.
+                # Eski surumde bu blok imshow ile ayni if icindeydi; --no-display
+                # ile calistirildiginda FPS hic guncellenmiyordu.
+                self.fps_counter += 1
+                if time.time() - self.fps_start_time > 1.0:
+                    self.current_fps = self.fps_counter
+                    self.fps_counter = 0
+                    self.fps_start_time = time.time()
+
         except KeyboardInterrupt:
             print("\n👋 Kullanıcı çıkışı")
         except Exception as e:
@@ -1226,16 +1445,23 @@ class IHATrackingSystem:
             traceback.print_exc()
         finally:
             cap.release()
+            if writer is not None:
+                writer.release()
             self.flight_controller.close()
             cv2.destroyAllWindows()
-            
-            # İstatistikler
+
+            # Istatistikler. "Ortalama" gercekten ortalama: toplam kare /
+            # toplam sure. Eski surumde son saniyenin sayisi yazdiriliyordu.
+            gecen = max(time.time() - self.session_start, 1e-6)
+            ortalama = self.frame_count / gecen
+
             print("\n" + "═" * 50)
             print("📊 OTURUM İSTATİSTİKLERİ")
             print("═" * 50)
-            print(f"   Toplam frame: {self.frame_count}")
-            print(f"   Ortalama FPS: {self.current_fps}")
-            print(f"   Toplam kilit sayısı: {self.lock_tracker.lock_count}")
+            print(f"   Toplam frame      : {self.frame_count}")
+            print(f"   Süre              : {gecen:.1f} sn")
+            print(f"   Ortalama FPS      : {ortalama:.1f}")
+            print(f"   Toplam kilit      : {self.lock_tracker.lock_count}")
             print("═" * 50 + "\n")
 
 
@@ -1243,63 +1469,127 @@ class IHATrackingSystem:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    # ═══════════════════════════════════════════════════════════════════════════
-    # PERFORMANS AYARLARI - CPU modunda 25-35 FPS için optimize edildi
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    config = SystemConfig(
-        # YOLO - KALİTE + PERFORMANS DENGESİ
-        yolo_img_size=320,          # 320=Standart kalite
-        yolo_conf_threshold=0.55,   # Yüksek = daha az yanlış tespit
-        yolo_skip_frames=2,         # 2=Dengeli
-        yolo_half=False,            # CPU'da False olmalı
-        
-        # SORT - Frame skip için optimize
-        sort_max_age=50,            # Kayıp toleransı artırıldı
-        sort_min_hits=2,            # Daha hızlı onay
-        sort_iou_threshold=0.2,     # Daha esnek eşleştirme
-        max_objects=10,
-        
-        # Kilitlenme
-        lock_duration_required=4.0,
-        lock_lost_timeout=1.5,      # Hedef kaybolma toleransı (saniye)
-        
-        # PID (değişmedi)
-        pid_yaw_kp=0.5,
-        pid_yaw_ki=0.01,
-        pid_yaw_kd=0.1,
-        pid_pitch_kp=0.5,
-        pid_pitch_ki=0.01,
-        pid_pitch_kd=0.1,
-        
-        # Seri port
-        serial_enabled=False,
-        serial_port="/dev/ttyTHS1",
-        
-        # Görselleştirme
-        show_display=True,
-        show_trails=True,
-        trail_length=15,            # Daha kısa trail (hız için)
-        
-        # Kamera
-        camera_id=0,
-        camera_width=640,
-        camera_height=480,
-        
-        # Threading
-        use_threading=True,         # Kamera okuma ayrı thread
-    )
-    
-    print("\n" + "=" * 60)
-    print("   FPS OPTİMİZASYONU AKTİF")
-    print("=" * 60)
-    print(f"   • YOLO boyutu: {config.yolo_img_size}px (düşük = hızlı)")
-    print(f"   • Frame skip: Her {config.yolo_skip_frames} frame'de 1 tespit")
-    print(f"   • Threaded kamera: {'Evet' if config.use_threading else 'Hayır'}")
-    print("=" * 60 + "\n")
-    
-    # Sistemi başlat
-    system = IHATrackingSystem(config)
-    system.run()
 
+# ═══════════════════════════════════════════════════════════════════════════════════
+# GİRİŞ NOKTASI
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    """Komut satiri arayuzu.
+
+    Onceki surumde butun ayarlar __main__ icine gomuluydu; kamerayi degistirmek
+    ya da bir video dosyasi denemek icin kaynak kodu duzenlemek gerekiyordu.
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="iha_tracking_system.py",
+        description="TEKNOFEST Savasan IHA - takip ve kontrol sistemi",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+ornekler:
+  python iha_tracking_system.py                      # varsayilan kamera
+  python iha_tracking_system.py --source 1           # ikinci kamera
+  python iha_tracking_system.py --source ucus.mp4    # video dosyasi
+  python iha_tracking_system.py --source ucus.mp4 --record cikti.mp4
+  python iha_tracking_system.py --no-display         # basliksiz (sunucu/SSH)
+  python iha_tracking_system.py --model yolo/best.pt --classes 0 1
+""",
+    )
+
+    g = p.add_argument_group("goruntu kaynagi")
+    g.add_argument("--source", default="0",
+                   help="kamera indeksi (0, 1, ...) veya video dosyasi yolu")
+    g.add_argument("--width", type=int, default=640, help="kamera genisligi")
+    g.add_argument("--height", type=int, default=480, help="kamera yuksekligi")
+
+    g = p.add_argument_group("model")
+    g.add_argument("--model", default="",
+                   help="model yolu. bos birakilirsa yolo/ altinda aranir, "
+                        "bulunamazsa hazir modele dusulur")
+    g.add_argument("--imgsz", type=int, default=320,
+                   help="YOLO giris boyutu (dusuk = hizli)")
+    g.add_argument("--conf", type=float, default=0.55,
+                   help="yuksek guven esigi — bunun ustundeki tespitler yeni iz "
+                        "baslatir (ByteTrack 1. tur)")
+    g.add_argument("--conf-low", type=float, default=0.1,
+                   help="dusuk guven esigi — bu araliktakiler yeni iz baslatmaz, "
+                        "yalniz mevcut izleri ayakta tutar (ByteTrack 2. tur)")
+    g.add_argument("--skip", type=int, default=2,
+                   help="her N karede bir tespit calistir (aradakiler Kalman)")
+    g.add_argument("--classes", type=int, nargs="+", default=[0],
+                   help="takip edilecek sinif kimlikleri")
+    g.add_argument("--half", action="store_true",
+                   help="FP16 kullan (yalniz CUDA'da anlamli)")
+
+    g = p.add_argument_group("takip ve kilit")
+    g.add_argument("--max-objects", type=int, default=10)
+    g.add_argument("--lock-seconds", type=float, default=4.0,
+                   help="kesintisiz kilit suresi (yarisma kurali)")
+
+    g = p.add_argument_group("cikis")
+    g.add_argument("--no-display", action="store_true",
+                   help="pencere acma (baslikli ortam yoksa)")
+    g.add_argument("--record", default="",
+                   help="islenmis goruntuyu bu dosyaya yaz")
+    g.add_argument("--serial", action="store_true",
+                   help="ucus kontrolcusune seri porttan komut gonder")
+    g.add_argument("--serial-port", default="/dev/ttyTHS1")
+
+    return p.parse_args()
+
+
+def main():
+    a = parse_args()
+
+    config = SystemConfig(
+        # Model
+        yolo_model_path=a.model,
+        yolo_img_size=a.imgsz,
+        yolo_conf_threshold=a.conf,
+        track_high_thresh=a.conf,
+        track_low_thresh=a.conf_low,
+        yolo_skip_frames=max(1, a.skip),
+        yolo_half=a.half and torch.cuda.is_available(),
+        yolo_classes=tuple(a.classes),
+
+        # Takip
+        max_objects=a.max_objects,
+        lock_duration_required=a.lock_seconds,
+
+        # Kaynak
+        camera_id=a.source,
+        camera_width=a.width,
+        camera_height=a.height,
+
+        # Cikis
+        show_display=not a.no_display,
+        record_path=a.record,
+        serial_enabled=a.serial,
+        serial_port=a.serial_port,
+    )
+
+    cihaz = "CUDA" if torch.cuda.is_available() else "CPU"
+    print("\n" + "=" * 62)
+    print("   TEKNOFEST SAVASAN IHA - TAKIP VE KONTROL SISTEMI")
+    print("=" * 62)
+    print(f"   Kaynak     : {a.source}")
+    print(f"   Cihaz      : {cihaz}")
+    print(f"   YOLO boyutu: {a.imgsz}px   guven: {a.conf}   kare atlama: {a.skip}")
+    print(f"   Goruntu    : {'kapali' if a.no_display else 'acik'}")
+    print("=" * 62)
+
+    try:
+        IHATrackingSystem(config).run()
+    except KeyboardInterrupt:
+        print("\nKullanici cikisi")
+        return 130
+    except Exception as e:
+        print(f"\nHATA: {e}")
+        traceback.print_exc()
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

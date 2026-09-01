@@ -310,194 +310,213 @@ class SortMultiTracker:
 # YOLO Model Seçimi
 # ---------------------------------------------------------------------------
 
-BEST_FP16_ENGINE_PATH = os.path.join(current_dir, "yolo", "best_fp16_640.engine")
-YOLO_ENGINE_PATH = os.path.join(current_dir, "yolo", "best.engine")
-YOLO_PT_PATH = os.path.join(current_dir, "yolo", "best.pt")
 
-if os.path.exists(BEST_FP16_ENGINE_PATH):
-    YOLO_MODEL_PATH = BEST_FP16_ENGINE_PATH
-    YOLO_MODEL_TYPE = "TensorRT Engine (640 FP16)"
-    YOLO_IMG_SIZE = 640
-elif os.path.exists(YOLO_ENGINE_PATH):
-    YOLO_MODEL_PATH = YOLO_ENGINE_PATH
-    YOLO_MODEL_TYPE = "TensorRT Engine"
-    YOLO_IMG_SIZE = 320
-elif os.path.exists(YOLO_PT_PATH):
-    YOLO_MODEL_PATH = YOLO_PT_PATH
-    YOLO_MODEL_TYPE = "PyTorch"
-    YOLO_IMG_SIZE = 640
-else:
-    print("❌ HATA: YOLO model dosyası bulunamadı!")
-    print(f"   Aranan: {BEST_FP16_ENGINE_PATH}")
-    print(f"   Veya:  {YOLO_ENGINE_PATH}")
-    print(f"   Veya:  {YOLO_PT_PATH}")
-    sys.exit(1)
+# ═══════════════════════════════════════════════════════════════════
+# GIRIS NOKTASI
+# ═══════════════════════════════════════════════════════════════════
 
-YOLO_CONF_THRESHOLD = 0.5
+def main():
+    """Uygulamayi calistir.
 
-print(f"📦 YOLO Model Tipi: {YOLO_MODEL_TYPE}")
-print(f"📂 Dosya: {os.path.basename(YOLO_MODEL_PATH)}")
+    NEDEN FONKSIYON ICINDE: onceden bu blok modul seviyesindeydi, yani
+    dosyayi import etmek MODEL YUKLEYIP kamerayi aciyordu.
+    """
+    BEST_FP16_ENGINE_PATH = os.path.join(current_dir, "yolo", "best_fp16_640.engine")
+    YOLO_ENGINE_PATH = os.path.join(current_dir, "yolo", "best.engine")
+    YOLO_PT_PATH = os.path.join(current_dir, "yolo", "best.pt")
 
-
-# ---------------------------------------------------------------------------
-# Model Yükleme
-# ---------------------------------------------------------------------------
-try:
-    print("\nModel yükleme başlıyor...")
-
-    if "TensorRT" in YOLO_MODEL_TYPE:
-        yolo_model = YOLO(YOLO_MODEL_PATH, task="detect")
-        print("✓ YOLO yüklendi (TensorRT Engine)")
+    if os.path.exists(BEST_FP16_ENGINE_PATH):
+        YOLO_MODEL_PATH = BEST_FP16_ENGINE_PATH
+        YOLO_MODEL_TYPE = "TensorRT Engine (640 FP16)"
+        YOLO_IMG_SIZE = 640
+    elif os.path.exists(YOLO_ENGINE_PATH):
+        YOLO_MODEL_PATH = YOLO_ENGINE_PATH
+        YOLO_MODEL_TYPE = "TensorRT Engine"
+        YOLO_IMG_SIZE = 320
+    elif os.path.exists(YOLO_PT_PATH):
+        YOLO_MODEL_PATH = YOLO_PT_PATH
+        YOLO_MODEL_TYPE = "PyTorch"
+        YOLO_IMG_SIZE = 640
     else:
-        yolo_model = YOLO(YOLO_MODEL_PATH)
-        print("✓ YOLO yüklendi (PyTorch)")
+        print("❌ HATA: YOLO model dosyası bulunamadı!")
+        print(f"   Aranan: {BEST_FP16_ENGINE_PATH}")
+        print(f"   Veya:  {YOLO_ENGINE_PATH}")
+        print(f"   Veya:  {YOLO_PT_PATH}")
+        sys.exit(1)
 
-    use_gpu = torch.cuda.is_available()
-    print(f"✓ CUDA: {'Var' if use_gpu else 'Yok'}")
+    YOLO_CONF_THRESHOLD = 0.5
 
-    sort_tracker = SortMultiTracker(
-        max_age=30,
-        min_hits=3,
-        iou_threshold=0.3,
-        max_trail_length=30,
-    )
-
-    print("✅ YOLO + SORT sistemi hazır\n")
-
-except Exception as e:
-    print(f"❌ Hata: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+    print(f"📦 YOLO Model Tipi: {YOLO_MODEL_TYPE}")
+    print(f"📂 Dosya: {os.path.basename(YOLO_MODEL_PATH)}")
 
 
-# ---------------------------------------------------------------------------
-# Kamera ve Ana Döngü
-# ---------------------------------------------------------------------------
-
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("❌ Kamera açılamadı")
-    sys.exit(1)
-
-print("📷 Kamera açıldı - YOLO + SORT Çoklu Nesne Takibi")
-print("   • Siam/SiamRPN++ YOK")
-print("   • YOLO tespit + SORT (Kalman + IoU)")
-print("   • 'q' ile çıkış\n")
-
-fps_counter = 0
-fps_start_time = time.time()
-current_fps = 0
-
-SHOW_TRAILS = True
-
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # YOLO tespit
-        if "TensorRT" in YOLO_MODEL_TYPE:
-            results = yolo_model.predict(
-                frame,
-                imgsz=YOLO_IMG_SIZE,
-                conf=YOLO_CONF_THRESHOLD,
-                device=0,
-                verbose=False,
-                half=True,
-            )
-        else:
-            results = yolo_model.predict(
-                frame,
-                imgsz=YOLO_IMG_SIZE,
-                conf=YOLO_CONF_THRESHOLD,
-                device=0 if torch.cuda.is_available() else "cpu",
-                verbose=False,
-            )
-
-        detections = []
-        if len(results[0].boxes) > 0:
-            for det in results[0].boxes:
-                bbox_xyxy = det.xyxy[0].cpu().numpy()
-                conf = det.conf[0].item()
-                detections.append({"bbox": bbox_xyxy, "score": conf})
-
-        # SORT güncelle
-        sort_tracker.update(detections)
-
-        # Çizim
-        display_frame = sort_tracker.draw(frame.copy(), show_trails=SHOW_TRAILS)
-
-        # FPS
-        fps_counter += 1
-        if time.time() - fps_start_time > 1.0:
-            current_fps = fps_counter
-            fps_counter = 0
-            fps_start_time = time.time()
-
-        # Bilgi paneli
-        tracked_count = len(sort_tracker.get_tracked_objects())
-        det_count = len(detections)
-
-        cv2.rectangle(display_frame, (5, 5), (320, 120), (0, 0, 0), -1)
-        cv2.rectangle(display_frame, (5, 5), (320, 120), (50, 50, 50), 2)
-
-        cv2.putText(
-            display_frame,
-            f"FPS: {current_fps}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-
-        cv2.putText(
-            display_frame,
-            f"Tracked: {tracked_count}",
-            (10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-
-        cv2.putText(
-            display_frame,
-            f"Detections: {det_count}",
-            (10, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 150, 0),
-            1,
-        )
-
-        cv2.putText(
-            display_frame,
-            "YOLO + SORT",
-            (10, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 200, 200),
-            1,
-        )
-
-        cv2.imshow("YOLO + SORT Multi-Object Tracker", display_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-except KeyboardInterrupt:
-    print("\n👋 Çıkış yapıldı")
-except Exception as e:
-    print(f"\n❌ Hata: {e}")
-    traceback.print_exc()
-finally:
-    cap.release()
+    # ---------------------------------------------------------------------------
+    # Model Yükleme
+    # ---------------------------------------------------------------------------
     try:
-        cv2.destroyAllWindows()
-    except cv2.error:
-        pass
-    print("✅ Temizlendi")
+        print("\nModel yükleme başlıyor...")
+
+        if "TensorRT" in YOLO_MODEL_TYPE:
+            yolo_model = YOLO(YOLO_MODEL_PATH, task="detect")
+            print("✓ YOLO yüklendi (TensorRT Engine)")
+        else:
+            yolo_model = YOLO(YOLO_MODEL_PATH)
+            print("✓ YOLO yüklendi (PyTorch)")
+
+        use_gpu = torch.cuda.is_available()
+        print(f"✓ CUDA: {'Var' if use_gpu else 'Yok'}")
+
+        sort_tracker = SortMultiTracker(
+            max_age=30,
+            min_hits=3,
+            iou_threshold=0.3,
+            max_trail_length=30,
+        )
+
+        print("✅ YOLO + SORT sistemi hazır\n")
+
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 
+    # ---------------------------------------------------------------------------
+    # Kamera ve Ana Döngü
+    # ---------------------------------------------------------------------------
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Kamera açılamadı")
+        sys.exit(1)
+
+
+
+    print("📷 Kamera açıldı - YOLO + SORT Çoklu Nesne Takibi")
+    print("   • Siam/SiamRPN++ YOK")
+    print("   • YOLO tespit + SORT (Kalman + IoU)")
+    print("   • 'q' ile çıkış\n")
+
+    fps_counter = 0
+    fps_start_time = time.time()
+    current_fps = 0
+
+    SHOW_TRAILS = True
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # YOLO tespit
+            if "TensorRT" in YOLO_MODEL_TYPE:
+                results = yolo_model.predict(
+                    frame,
+                    imgsz=YOLO_IMG_SIZE,
+                    conf=YOLO_CONF_THRESHOLD,
+                    device=0 if torch.cuda.is_available() else 'cpu',
+                    verbose=False,
+                    half=True,
+                )
+            else:
+                results = yolo_model.predict(
+                    frame,
+                    imgsz=YOLO_IMG_SIZE,
+                    conf=YOLO_CONF_THRESHOLD,
+                    device=0 if torch.cuda.is_available() else "cpu",
+                    verbose=False,
+                )
+
+            detections = []
+            if len(results[0].boxes) > 0:
+                for det in results[0].boxes:
+                    bbox_xyxy = det.xyxy[0].cpu().numpy()
+                    conf = det.conf[0].item()
+                    detections.append({"bbox": bbox_xyxy, "score": conf})
+
+            # SORT güncelle
+            sort_tracker.update(detections)
+
+            # Çizim
+            display_frame = sort_tracker.draw(frame.copy(), show_trails=SHOW_TRAILS)
+
+            # FPS
+            fps_counter += 1
+            if time.time() - fps_start_time > 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_start_time = time.time()
+
+            # Bilgi paneli
+            tracked_count = len(sort_tracker.get_tracked_objects())
+            det_count = len(detections)
+
+            cv2.rectangle(display_frame, (5, 5), (320, 120), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (5, 5), (320, 120), (50, 50, 50), 2)
+
+            cv2.putText(
+                display_frame,
+                f"FPS: {current_fps}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                display_frame,
+                f"Tracked: {tracked_count}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+
+            cv2.putText(
+                display_frame,
+                f"Detections: {det_count}",
+                (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 150, 0),
+                1,
+            )
+
+            cv2.putText(
+                display_frame,
+                "YOLO + SORT",
+                (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (200, 200, 200),
+                1,
+            )
+
+            cv2.imshow("YOLO + SORT Multi-Object Tracker", display_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    except KeyboardInterrupt:
+        print("\n👋 Çıkış yapıldı")
+    except Exception as e:
+        print(f"\n❌ Hata: {e}")
+        traceback.print_exc()
+    finally:
+        cap.release()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+        print("✅ Temizlendi")
+
+
+
+
+
+
+if __name__ == "__main__":
+    main()

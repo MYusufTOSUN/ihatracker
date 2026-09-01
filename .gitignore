@@ -44,3 +44,9 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# Test artiklari
+test_*.mp4
+test_*.png
+yolo11n.pt
+yolov8*.pt

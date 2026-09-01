@@ -459,180 +459,196 @@ class ByteTrackMultiTracker:
 
 
 # --- MAIN ---
-YOLO_ENGINE_PATH = os.path.join(current_dir, "yolo", "best.engine")
-YOLO_PT_PATH = os.path.join(current_dir, "yolo", "best.pt")
+
+# ═══════════════════════════════════════════════════════════════════
+# GIRIS NOKTASI
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    """Uygulamayi calistir.
+
+    NEDEN FONKSIYON ICINDE: onceden bu blok modul seviyesindeydi, yani
+    dosyayi import etmek KAMERAYI ACIP sistemi baslatiyordu. Icindeki
+    siniflari baska bir yerde yeniden kullanmak imkansizdi.
+    """
+    YOLO_ENGINE_PATH = os.path.join(current_dir, "yolo", "best.engine")
+    YOLO_PT_PATH = os.path.join(current_dir, "yolo", "best.pt")
  
-# ÖNCE best.engine'i kontrol et (TensorRT öncelikli!)
-if os.path.exists(YOLO_ENGINE_PATH):
-    YOLO_MODEL_PATH = YOLO_ENGINE_PATH
-    YOLO_MODEL_TYPE = "TensorRT Engine"
-    print("✅ best.engine bulundu - TensorRT kullanılacak")
-elif os.path.exists(YOLO_PT_PATH):
-    YOLO_MODEL_PATH = YOLO_PT_PATH
-    YOLO_MODEL_TYPE = "PyTorch"
-    print("⚠️ best.engine YOK - best.pt kullanılacak (daha yavaş)")
-else:
-    print("❌ HATA: YOLO model dosyası bulunamadı!")
-    print(f"   Aranan: {YOLO_ENGINE_PATH}")
-    print(f"   Veya: {YOLO_PT_PATH}")
-    sys.exit(1)
-
-YOLO_IMG_SIZE = 320  # TensorRT engine boyutu (sabit, değiştirilemez!)
-YOLO_CONF_THRESHOLD = 0.5  # Düşük threshold (ByteTrack için)
-MAX_OBJECTS = 20
-
-print(f"📦 YOLO Model: {YOLO_MODEL_TYPE}")
-print(f"📂 Dosya: {os.path.basename(YOLO_MODEL_PATH)}")
-
-# Model yükleme
-try:
-    print("\nModel yükleme başlıyor...")
-    
-    # YOLO - TensorRT Engine garantisi
-    if YOLO_MODEL_TYPE == "TensorRT Engine":
-        yolo_model = YOLO(YOLO_MODEL_PATH, task='detect')
-        print("✓ YOLO yüklendi (TensorRT Engine - MAKSIMUM HIZ)")
+    # ÖNCE best.engine'i kontrol et (TensorRT öncelikli!)
+    if os.path.exists(YOLO_ENGINE_PATH):
+        YOLO_MODEL_PATH = YOLO_ENGINE_PATH
+        YOLO_MODEL_TYPE = "TensorRT Engine"
+        print("✅ best.engine bulundu - TensorRT kullanılacak")
+    elif os.path.exists(YOLO_PT_PATH):
+        YOLO_MODEL_PATH = YOLO_PT_PATH
+        YOLO_MODEL_TYPE = "PyTorch"
+        print("⚠️ best.engine YOK - best.pt kullanılacak (daha yavaş)")
     else:
-        yolo_model = YOLO(YOLO_MODEL_PATH)
-        print("✓ YOLO yüklendi (PyTorch - standart hız)")
-        print("  ℹ️  Daha hızlı için best.engine kullanın")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # ByteTrack Multi-Tracker (yalnızca YOLO + Kalman)
-    tracker = ByteTrackMultiTracker(
-        device=device,
-        max_objects=MAX_OBJECTS
-    )
-    
-    print("✅ ByteTrack Sistemi Hazır\n")
+        print("❌ HATA: YOLO model dosyası bulunamadı!")
+        print(f"   Aranan: {YOLO_ENGINE_PATH}")
+        print(f"   Veya: {YOLO_PT_PATH}")
+        sys.exit(1)
 
-except Exception as e:
-    print(f"❌ Hata: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+    YOLO_IMG_SIZE = 320  # TensorRT engine boyutu (sabit, değiştirilemez!)
+    YOLO_CONF_THRESHOLD = 0.5  # Düşük threshold (ByteTrack için)
+    MAX_OBJECTS = 20
 
-# Kamera
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("❌ Kamera açılamadı")
-    sys.exit(1)
+    print(f"📦 YOLO Model: {YOLO_MODEL_TYPE}")
+    print(f"📂 Dosya: {os.path.basename(YOLO_MODEL_PATH)}")
 
-print("📷 Kamera açıldı - ByteTrack Multi-Object Tracking")
-print("   • Kalman filter ile hareket tahmini")
-print("   • Robust ID persistence")
-print("   • Optimize edilmiş performans")
-print("   • 'q' ile çıkış\n")
-
-fps_counter = 0
-fps_start_time = time.time()
-current_fps = 0
-total_detections = 0
-total_tracks = 0
-
-# Görselleştirme ayarları
-SHOW_RAW_DETECTIONS = True  # YOLO ham detection'larını göster
-
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # YOLO detection (TensorRT Engine garantisi ile)
-        if YOLO_MODEL_TYPE == "TensorRT Engine":
-            results = yolo_model.predict(
-                frame, 
-                imgsz=YOLO_IMG_SIZE,  # TensorRT engine boyutu
-                conf=YOLO_CONF_THRESHOLD,
-                device=0,      # GPU zorunlu (TensorRT)
-                verbose=False, 
-                half=True      # FP16 (TensorRT optimize)
-            )
-        else:
-            results = yolo_model.predict(
-                frame, 
-                imgsz=YOLO_IMG_SIZE, 
-                conf=YOLO_CONF_THRESHOLD,
-                device=0 if torch.cuda.is_available() else 'cpu',
-                verbose=False
-            )
-        
-        # Detections'ları hazırla
-        detections = []
-        if len(results[0].boxes) > 0:
-            for det in results[0].boxes:
-                bbox_xyxy = det.xyxy[0].cpu().numpy()
-                conf = det.conf[0].item()
-                detections.append({
-                    'bbox': bbox_xyxy,
-                    'score': conf
-                })
-            total_detections += len(detections)
-        
-        # ByteTrack güncelle
-        tracker.update(frame, detections)
-        total_tracks = max(total_tracks, len(tracker.get_tracked_objects()))
-        
-        # Çiz (ham detections ile birlikte)
-        display_frame = tracker.draw(
-            frame.copy(), 
-            show_raw_detections=SHOW_RAW_DETECTIONS,
-            raw_detections=detections
-        )
-        
-        # FPS
-        fps_counter += 1
-        if time.time() - fps_start_time > 1.0:
-            current_fps = fps_counter
-            fps_counter = 0
-            fps_start_time = time.time()
-        
-        # Gelişmiş Info panel
-        tracked_count = len(tracker.get_tracked_objects())
-        det_count = len(detections)
-        
-        # Panel arka planı (biraz daha büyük)
-        cv2.rectangle(display_frame, (5, 5), (320, 130), (0, 0, 0), -1)
-        cv2.rectangle(display_frame, (5, 5), (320, 130), (50, 50, 50), 2)
-        
-        # FPS (yeşil)
-        cv2.putText(display_frame, f"FPS: {current_fps}", (10, 25),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # Tracked count (sarı)
-        cv2.putText(display_frame, f"Tracked: {tracked_count}/{MAX_OBJECTS}", (10, 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
-        # Detection count (mavi)
-        cv2.putText(display_frame, f"Detections: {det_count}", (10, 75),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 0), 1)
-        
-        # Model tipi
-        model_text = "TensorRT" if YOLO_MODEL_TYPE == "TensorRT Engine" else "PyTorch"
-        model_color = (0, 255, 0) if YOLO_MODEL_TYPE == "TensorRT Engine" else (0, 165, 255)
-        cv2.putText(display_frame, f"Engine: {model_text}", (10, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, model_color, 1)
-        
-        # Algoritma
-        cv2.putText(display_frame, "ByteTrack + Kalman", (10, 120),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-        
-        cv2.imshow("ByteTrack Multi-Object Tracker", display_frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-except KeyboardInterrupt:
-    print("\n👋 Çıkış yapıldı")
-except Exception as e:
-    print(f"\n❌ Hata: {e}")
-    traceback.print_exc()
-finally:
-    cap.release()
+    # Model yükleme
     try:
-        cv2.destroyAllWindows()
-    except cv2.error:
-        pass
-    print("✅ Temizlendi")
+        print("\nModel yükleme başlıyor...")
+    
+        # YOLO - TensorRT Engine garantisi
+        if YOLO_MODEL_TYPE == "TensorRT Engine":
+            yolo_model = YOLO(YOLO_MODEL_PATH, task='detect')
+            print("✓ YOLO yüklendi (TensorRT Engine - MAKSIMUM HIZ)")
+        else:
+            yolo_model = YOLO(YOLO_MODEL_PATH)
+            print("✓ YOLO yüklendi (PyTorch - standart hız)")
+            print("  ℹ️  Daha hızlı için best.engine kullanın")
+    
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+        # ByteTrack Multi-Tracker (yalnızca YOLO + Kalman)
+        tracker = ByteTrackMultiTracker(
+            device=device,
+            max_objects=MAX_OBJECTS
+        )
+    
+        print("✅ ByteTrack Sistemi Hazır\n")
 
+    except Exception as e:
+        print(f"❌ Hata: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # Kamera
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Kamera açılamadı")
+        sys.exit(1)
+
+    print("📷 Kamera açıldı - ByteTrack Multi-Object Tracking")
+    print("   • Kalman filter ile hareket tahmini")
+    print("   • Robust ID persistence")
+    print("   • Optimize edilmiş performans")
+    print("   • 'q' ile çıkış\n")
+
+    fps_counter = 0
+    fps_start_time = time.time()
+    current_fps = 0
+    total_detections = 0
+    total_tracks = 0
+
+    # Görselleştirme ayarları
+    SHOW_RAW_DETECTIONS = True  # YOLO ham detection'larını göster
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        
+            # YOLO detection (TensorRT Engine garantisi ile)
+            if YOLO_MODEL_TYPE == "TensorRT Engine":
+                results = yolo_model.predict(
+                    frame, 
+                    imgsz=YOLO_IMG_SIZE,  # TensorRT engine boyutu
+                    conf=YOLO_CONF_THRESHOLD,
+                    device=0 if torch.cuda.is_available() else 'cpu',      # GPU zorunlu (TensorRT)
+                    verbose=False, 
+                    half=True      # FP16 (TensorRT optimize)
+                )
+            else:
+                results = yolo_model.predict(
+                    frame, 
+                    imgsz=YOLO_IMG_SIZE, 
+                    conf=YOLO_CONF_THRESHOLD,
+                    device=0 if torch.cuda.is_available() else 'cpu',
+                    verbose=False
+                )
+        
+            # Detections'ları hazırla
+            detections = []
+            if len(results[0].boxes) > 0:
+                for det in results[0].boxes:
+                    bbox_xyxy = det.xyxy[0].cpu().numpy()
+                    conf = det.conf[0].item()
+                    detections.append({
+                        'bbox': bbox_xyxy,
+                        'score': conf
+                    })
+                total_detections += len(detections)
+        
+            # ByteTrack güncelle
+            tracker.update(frame, detections)
+            total_tracks = max(total_tracks, len(tracker.get_tracked_objects()))
+        
+            # Çiz (ham detections ile birlikte)
+            display_frame = tracker.draw(
+                frame.copy(), 
+                show_raw_detections=SHOW_RAW_DETECTIONS,
+                raw_detections=detections
+            )
+        
+            # FPS
+            fps_counter += 1
+            if time.time() - fps_start_time > 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_start_time = time.time()
+        
+            # Gelişmiş Info panel
+            tracked_count = len(tracker.get_tracked_objects())
+            det_count = len(detections)
+        
+            # Panel arka planı (biraz daha büyük)
+            cv2.rectangle(display_frame, (5, 5), (320, 130), (0, 0, 0), -1)
+            cv2.rectangle(display_frame, (5, 5), (320, 130), (50, 50, 50), 2)
+        
+            # FPS (yeşil)
+            cv2.putText(display_frame, f"FPS: {current_fps}", (10, 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+            # Tracked count (sarı)
+            cv2.putText(display_frame, f"Tracked: {tracked_count}/{MAX_OBJECTS}", (10, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+            # Detection count (mavi)
+            cv2.putText(display_frame, f"Detections: {det_count}", (10, 75),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 0), 1)
+        
+            # Model tipi
+            model_text = "TensorRT" if YOLO_MODEL_TYPE == "TensorRT Engine" else "PyTorch"
+            model_color = (0, 255, 0) if YOLO_MODEL_TYPE == "TensorRT Engine" else (0, 165, 255)
+            cv2.putText(display_frame, f"Engine: {model_text}", (10, 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, model_color, 1)
+        
+            # Algoritma
+            cv2.putText(display_frame, "ByteTrack + Kalman", (10, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        
+            cv2.imshow("ByteTrack Multi-Object Tracker", display_frame)
+        
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("\n👋 Çıkış yapıldı")
+    except Exception as e:
+        print(f"\n❌ Hata: {e}")
+        traceback.print_exc()
+    finally:
+        cap.release()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+        print("✅ Temizlendi")
+
+
+
+if __name__ == "__main__":
+    main()

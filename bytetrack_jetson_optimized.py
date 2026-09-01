@@ -520,7 +520,7 @@ if __name__ == "__main__":
                     frame,
                     imgsz=YOLO_IMG_SIZE,  # 256x256
                     conf=YOLO_CONF_THRESHOLD,
-                    device=0,
+                    device=0 if torch.cuda.is_available() else 'cpu',
                     verbose=False,
                     half=True  # FP16
                 )
