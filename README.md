@@ -29,7 +29,7 @@ KİLİT         hedef üzerinde kesintisiz süre sayacı
 KONTROL       dört ayrı PID döngüsü
       │       yaw · pitch · roll · hız
       ▼
-ÇIKIŞ         UART / MAVLink  +  OpenCV görselleştirme
+ÇIKIŞ         UART (düz metin)  +  OpenCV görselleştirme
 ```
 
 ---
@@ -179,6 +179,18 @@ söndür, en son `ki` ile kalıcı hatayı kapat.
 
 `max_yaw_rate`, `max_pitch_rate`, `max_roll_rate`, `max_speed` çıkışı
 sınırlar — bunlar güvenlik sınırıdır, aracının kapasitesine göre ayarla.
+
+### Seri çıkış
+
+`--serial` ile UART'a (varsayılan `/dev/ttyTHS1`, 115200) **düz metin** yazılır:
+
+```
+YAW,PITCH,ROLL,THR
+        örn.  12.40,-3.15,3.72,0.28
+```
+
+**MAVLink değildir.** Uçuş kontrolcünün bu satırı okuyup çözmesi gerekir; ArduPilot
+veya PX4'e doğrudan bağlamak istersen araya pymavlink ile bir köprü koymalısın.
 
 Tam liste: `python iha_tracking_system.py --help`
 
